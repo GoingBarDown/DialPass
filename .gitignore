@@ -1,0 +1,28 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.python-version
+
+# Env / secrets
+.env
+.env.local
+*.pem
+
+# Tooling
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+
+# Audio fixtures (large / generated)
+scratch/
+*.raw
+
+# OS / editor
+.DS_Store
+.idea/
+.vscode/

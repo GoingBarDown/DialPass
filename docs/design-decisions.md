@@ -434,4 +434,6 @@ feeds two things:
 
 ## Status
 
-All four design decisions are locked. Next step: build **M1**.
+All four design decisions are locked. **M1 is built** (skeleton, offline
+pipeline, detection FSM, codec, CI). Next: **M2** — real Twilio outbound call +
+Media Streams in. See the README for milestone status.

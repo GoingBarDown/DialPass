@@ -1,0 +1,12 @@
+# M1: just the app. localstack (SQS) + postgres get added in M7 when the
+# telemetry pipeline lands.
+services:
+  app:
+    build: .
+    ports:
+      - "8000:8000"
+    env_file:
+      - .env
+    environment:
+      DIALPASS_HOST: 0.0.0.0
+      DIALPASS_PORT: "8000"

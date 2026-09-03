@@ -338,8 +338,11 @@ thrash. Four mechanisms:
    high-confidence frames count toward the debounce counter. Transition-moment
    low-confidence frames don't push the FSM.
 4. **Refractory period** — after a failed probe, block re-entry to
-   `EVALUATING_SPEECH` for ~15–20 s so one ambiguous stretch doesn't fire three
-   probes.
+   `EVALUATING_SPEECH` for ~8 s so the tail of one interjection doesn't fire
+   three probes. We enter `EVALUATING_SPEECH` ~2 s into an interjection, so ~8 s
+   covers a typical one; a rare long announcement gets re-probed once (cheap).
+   M3 refinement: strong evidence (speech, no music bed, no match to the stored
+   interjection fingerprint) overrides the block.
 
 ### Worked example — music → interjection → music
 

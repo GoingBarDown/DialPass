@@ -54,7 +54,11 @@ class FsmConfig:
     enter_eval_frames: int = 2  # ON_HOLD -> EVALUATING_SPEECH (easy, asymmetric)
     leave_eval_frames: int = 5  # EVALUATING_SPEECH -> ON_HOLD (hard, asymmetric)
     non_connect_frames: int = 2  # any live state -> FAILED
-    refractory_s: float = 18.0  # block re-EVALUATING after a failed probe
+    # Block re-EVALUATING after a failed probe. We enter EVALUATING ~2s into an
+    # interjection, so ~8s covers the tail of a typical one. A rare long
+    # announcement gets re-probed once (cheap). M3: let strong evidence
+    # (speech, no music bed, no interjection-fingerprint match) override this.
+    refractory_s: float = 8.0
     min_confidence: float = 0.55  # frames below this don't advance a streak
 
 

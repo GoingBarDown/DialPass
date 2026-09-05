@@ -27,3 +27,20 @@ def voice_twiml(request: Request, conference: str = Query(...)) -> Response:
     stream_url = _media_ws_url(settings.public_base_url)
     xml = stream_and_conference(stream_url, conference)
     return Response(content=xml, media_type="application/xml")
+
+
+@router.api_route("/twiml/holdmusic-test", methods=["GET", "POST"])
+def holdmusic_test_twiml(request: Request) -> Response:
+    """M3 dev only: fork audio to /media and play classic hold music into the
+    call so we can capture real phone-band music to tune Tier 1 against.
+    Not wired into any production path — remove after M3."""
+    settings = request.app.state.settings
+    stream_url = _media_ws_url(settings.public_base_url)
+    xml = (
+        '<?xml version="1.0" encoding="UTF-8"?>'
+        "<Response>"
+        f'<Start><Stream url="{stream_url}" track="outbound_track"/></Start>'
+        '<Play loop="6">http://demo.twilio.com/docs/classic.mp3</Play>'
+        "</Response>"
+    )
+    return Response(content=xml, media_type="application/xml")

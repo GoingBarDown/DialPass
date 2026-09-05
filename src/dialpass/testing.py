@@ -58,7 +58,19 @@ def _speech_like(seconds: float, amp: float = 0.25, syllable_hz: float = 4.0) ->
     spec[(freqs < 300) | (freqs > 3400)] = 0
     band = np.fft.irfft(spec, n)
     band /= np.max(np.abs(band)) or 1.0
-    envelope = 0.5 * (1 + np.sin(2 * np.pi * syllable_hz * np.arange(n) / SAMPLE_RATE))
+    # Syllabic envelope with real gaps: alternating voiced bursts and short
+    # near-silent pauses at ~syllable_hz. This is what separates speech from a
+    # sustained music bed for the Tier 1 envelope features (quiet_frac, env_cv).
+    mean_syl = SAMPLE_RATE / syllable_hz
+    envelope = np.zeros(n)
+    i = 0
+    while i < n:
+        burst = int(rng.uniform(0.45, 0.9) * mean_syl)
+        gap = int(rng.uniform(0.25, 0.8) * mean_syl)
+        j = min(n, i + burst)
+        ramp = np.minimum(np.arange(j - i), (j - i) - np.arange(j - i)) / max(1, 0.15 * mean_syl)
+        envelope[i:j] = np.clip(ramp, 0.0, 1.0)
+        i = j + gap
     return amp * band * envelope
 
 

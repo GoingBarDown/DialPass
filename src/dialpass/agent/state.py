@@ -191,12 +191,20 @@ class CallStateMachine:
         """Waiting for the call to connect (past ringback). Any sustained
         speech-like label (menu prompt or generic speech) means someone/
         something answered -> move to IVR_MENU and immediately wake Tier 2
-        to listen to and interpret the greeting/menu."""
+        to listen to and interpret the greeting/menu.
+
+        Some lines skip the menu entirely ("all agents are busy" straight into
+        a music queue). Sustained hold music from DIALING is that case -> go
+        directly to ON_HOLD; the ON_HOLD handler will still catch a later menu.
+        """
         speech = label in MENU_LABELS or label == Label.LIVE_SPEECH_CANDIDATE
         if speech and streak >= self.cfg.enter_menu_frames:
             self._enter(CallState.IVR_MENU)
             self._menu_woken = True  # this transition already wakes Tier 2
             return Action.WAKE_TIER2_MENU
+        if label == Label.HOLD_MUSIC and streak >= self.cfg.enter_hold_frames:
+            self._enter(CallState.ON_HOLD)
+            return Action.NONE
         return Action.NONE
 
     def _on_ivr_menu(self, label: Label, streak: int, now: float) -> Action:

@@ -43,10 +43,21 @@ class Classifier(Protocol):
 # --------------------------------------------------------------------------
 # Feature extraction
 # --------------------------------------------------------------------------
+_EMPTY_FEATURES = {
+    "rms": 0.0,
+    "zcr": 0.0,
+    "flatness": 1.0,
+    "tone_460_ratio": 0.0,
+    "quiet_frac": 1.0,
+    "env_cv": 0.0,
+    "mod_4hz": 0.0,
+}
+
+
 def acoustic_features(pcm: np.ndarray, sample_rate: int) -> dict[str, float]:
     """Cheap frame-level features. Everything here is O(n log n) or better."""
     if pcm.size == 0:
-        return {"rms": 0.0, "zcr": 0.0, "flatness": 1.0, "tone_460_ratio": 0.0}
+        return dict(_EMPTY_FEATURES)
 
     x = pcm.astype(np.float64) / 32768.0
     rms = float(np.sqrt(np.mean(x**2)))
@@ -64,33 +75,76 @@ def acoustic_features(pcm: np.ndarray, sample_rate: int) -> dict[str, float]:
     # US ringback = 440 + 480 Hz; energy clustered there is a strong ringback cue.
     ring_band = float(np.sum(spectrum[(freqs >= 400) & (freqs <= 520)])) / total
 
-    return {"rms": rms, "zcr": zcr, "flatness": flatness, "tone_460_ratio": ring_band}
+    # --- temporal envelope --------------------------------------------------
+    # Static spectra can't separate phone-band speech from a music bed (both are
+    # low-flatness). The amplitude envelope can: speech pulses at the syllable
+    # rate with near-silent gaps between words; sustained music runs steadier.
+    # Sub-frame RMS at 25 ms, then: fraction of the window that's near-silent
+    # (quiet_frac), envelope coefficient of variation (env_cv), and the share of
+    # envelope energy in the 3-8 Hz syllabic / beat band (mod_4hz).
+    hop = max(1, int(sample_rate * 0.025))
+    n_sub = int(x.size // hop)
+    if n_sub >= 4:
+        sub = np.sqrt(np.mean(x[: n_sub * hop].reshape(n_sub, hop) ** 2, axis=1) + 1e-12)
+        peak = float(sub.max())
+        quiet_frac = float(np.mean(sub < 0.2 * peak)) if peak > 1e-6 else 1.0
+        env_cv = float(sub.std() / (sub.mean() + 1e-9))
+        env = sub - sub.mean()
+        env_spec = np.abs(np.fft.rfft(env)) ** 2
+        env_freqs = np.fft.rfftfreq(env.size, d=hop / sample_rate)
+        syllabic = (env_freqs >= 3.0) & (env_freqs <= 8.0)
+        mod_4hz = float(np.sum(env_spec[syllabic]) / (np.sum(env_spec) + 1e-12))
+    else:
+        quiet_frac, env_cv, mod_4hz = 1.0, 0.0, 0.0
+
+    return {
+        "rms": rms,
+        "zcr": zcr,
+        "flatness": flatness,
+        "tone_460_ratio": ring_band,
+        "quiet_frac": quiet_frac,
+        "env_cv": env_cv,
+        "mod_4hz": mod_4hz,
+    }
 
 
 class HeuristicClassifier:
-    """Rough hand rules over `acoustic_features`. Tuned properly in M3."""
+    """Hand rules over `acoustic_features`, tuned in M3 against recorded real
+    calls (Delta IVR + ringback, live human speech, phone-band hold music).
 
-    SILENCE_RMS = 0.005
+    Tier 1 only makes the coarse acoustic call — silence / ringback / music /
+    speech-candidate. Telling a recorded menu voice from a live human is left to
+    the Tier 2 probe; both look the same to these features.
+    """
+
+    SILENCE_RMS = 0.01
 
     def classify(self, frame: Frame) -> Classification:
         f = acoustic_features(frame.pcm, frame.sample_rate)
-        rms, zcr, flatness, ring = (
-            f["rms"],
-            f["zcr"],
-            f["flatness"],
-            f["tone_460_ratio"],
-        )
+        rms, flatness, ring = f["rms"], f["flatness"], f["tone_460_ratio"]
+        quiet, env_cv, mod = f["quiet_frac"], f["env_cv"], f["mod_4hz"]
 
         if rms < self.SILENCE_RMS:
             return Classification(Label.SILENCE, 0.9, f)
+
+        # US ringback = 440 + 480 Hz: energy tightly in-band and near-pure tone.
+        # The ring-band gate alone excludes music and speech (both well under 0.6).
         if ring > 0.6 and flatness < 0.1:
-            return Classification(Label.RINGBACK, 0.75, f)
-        if flatness < 0.15:
-            # tonal + sustained energy -> music bed
-            return Classification(Label.HOLD_MUSIC, 0.6, f)
-        if zcr > 0.08 and flatness > 0.2:
-            # broadband, gappy -> speech; Tier 1 alone can't tell menu from human
-            return Classification(Label.LIVE_SPEECH_CANDIDATE, 0.55, f)
+            return Classification(Label.RINGBACK, 0.8, f)
+
+        # Speech vs music bed — decided on the envelope, not the spectrum.
+        # Speech: near-silent gaps between syllables (high quiet_frac / env_cv).
+        # Music bed: steady, and this style carries a strong beat (high mod_4hz).
+        musicky = mod >= 0.5 and quiet < 0.32 and env_cv < 0.75
+        speechy = quiet >= 0.25 or env_cv >= 0.62
+
+        if musicky:
+            return Classification(Label.HOLD_MUSIC, 0.65, f)
+        if speechy:
+            return Classification(Label.LIVE_SPEECH_CANDIDATE, 0.6, f)
+        if flatness < 0.08 and env_cv < 0.6:
+            # steady + tonal, no syllabic structure -> music bed
+            return Classification(Label.HOLD_MUSIC, 0.55, f)
         return Classification(Label.UNKNOWN, 0.4, f)
 
 

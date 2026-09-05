@@ -26,6 +26,9 @@ class Settings(BaseSettings):
     twilio_auth_token: str = ""
     twilio_from_number: str = ""
     public_base_url: str = ""
+    # If set, each call's decoded 8 kHz PCM is written to <record_dir>/<call_id>.wav.
+    # Dev aid for M3 classifier tuning; leave blank in production.
+    record_dir: str = ""
 
     # Realtime / Tier 2 (M4+)
     openai_api_key: str = ""

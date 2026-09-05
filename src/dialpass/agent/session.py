@@ -122,16 +122,25 @@ class AgentSession:
 
     def _handle_menu(self, now: float) -> None:
         self.telemetry.emit(Tier2Woken(call_id=self.call_id, t=now, reason="menu"))
-        decision = self.tier2.choose_menu_digit(
-            self.buffer.snapshot(), self.settings.sample_rate, self.goal
-        )
+        try:
+            decision = self.tier2.choose_menu_digit(
+                self.buffer.snapshot(), self.settings.sample_rate, self.goal
+            )
+        except NotImplementedError:
+            # Real Tier 2 (M4) isn't wired yet — don't crash a live call over it.
+            self._fail(now, reason="tier2_not_implemented")
+            return
         if decision.digits:
             self.telemetry.emit(DtmfSent(call_id=self.call_id, t=now, digits=decision.digits))
             # M4: synthesize dual-tone PCM and inject into the outbound stream.
 
     def _handle_probe(self, now: float) -> None:
         self.telemetry.emit(Tier2Woken(call_id=self.call_id, t=now, reason="probe"))
-        outcome = self.tier2.probe(self.buffer.snapshot(), self.settings.sample_rate)
+        try:
+            outcome = self.tier2.probe(self.buffer.snapshot(), self.settings.sample_rate)
+        except NotImplementedError:
+            self._fail(now, reason="tier2_not_implemented")
+            return
         self.telemetry.emit(ProbeResult(call_id=self.call_id, t=now, is_human=outcome.is_human))
         before = self.fsm.state
         follow_up = self.fsm.probe_result(outcome.is_human, now)
@@ -140,7 +149,11 @@ class AgentSession:
 
     def _bridge(self, now: float) -> None:
         self.telemetry.emit(HumanDetected(call_id=self.call_id, t=now))
-        self.tier2.say_to_agent("Thanks for picking up — connecting my client now, one moment.")
+        try:
+            self.tier2.say_to_agent("Thanks for picking up — connecting my client now, one moment.")
+        except NotImplementedError:
+            self._fail(now, reason="tier2_not_implemented")
+            return
         before = self.fsm.state
         self.fsm.bridged()
         self._emit_state_change(before, now)

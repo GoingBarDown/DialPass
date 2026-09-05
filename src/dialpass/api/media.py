@@ -36,7 +36,8 @@ async def media_stream(ws: WebSocket) -> None:
             if event == "start":
                 start = msg.get("start", {})
                 call_id = start.get("callSid") or start.get("streamSid") or "unknown"
-                session = app.state.make_session(call_id)
+                goal = app.state.pending_goals.pop(call_id, None)
+                session = app.state.make_session(call_id, goal=goal)
                 app.state.sessions[call_id] = session
                 log.info("media stream started for call %s", call_id)
 

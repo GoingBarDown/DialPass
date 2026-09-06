@@ -142,8 +142,10 @@ class HeuristicClassifier:
             return Classification(Label.HOLD_MUSIC, 0.65, f)
         if speechy:
             return Classification(Label.LIVE_SPEECH_CANDIDATE, 0.6, f)
-        if flatness < 0.08 and env_cv < 0.6:
-            # steady + tonal, no syllabic structure -> music bed
+        if flatness < 0.08 and env_cv < 0.6 and mod >= 0.45:
+            # steady + tonal + rhythmic, no syllabic structure -> music bed.
+            # The mod gate matters: a smoothly-read menu sentence with no pause
+            # in the window is also steady + tonal but has weak 3-8 Hz energy.
             return Classification(Label.HOLD_MUSIC, 0.55, f)
         return Classification(Label.UNKNOWN, 0.4, f)
 

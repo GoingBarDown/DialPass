@@ -25,6 +25,12 @@ class Label(StrEnum):
 # A menu is being spoken or is waiting for input.
 MENU_LABELS = frozenset({Label.MENU_SPEAKING, Label.MENU_AWAITING_INPUT})
 
+# Any speech-like label. The heuristic Tier 1 only ever emits
+# LIVE_SPEECH_CANDIDATE (it can't tell a menu voice from a human); a richer
+# classifier would use MENU_*. Handlers that just need "someone/something is
+# talking" (e.g. is a submenu playing?) check this set.
+SPEECHY_LABELS = MENU_LABELS | {Label.LIVE_SPEECH_CANDIDATE}
+
 # The call did not connect — fail fast, no hold logic.
 NON_CONNECT_LABELS = frozenset({Label.VOICEMAIL, Label.ERROR_TONE})
 

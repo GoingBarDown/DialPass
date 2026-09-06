@@ -33,6 +33,9 @@ class Settings(BaseSettings):
     # Realtime / Tier 2 (M4+)
     openai_api_key: str = ""
     realtime_model: str = "gpt-realtime-mini"
+    # Menu decisions need strict JSON-format compliance; the mini model won't
+    # hold format and keeps conversing, so the full model is used for that turn.
+    realtime_menu_model: str = "gpt-realtime"
 
     @property
     def sample_rate(self) -> int:

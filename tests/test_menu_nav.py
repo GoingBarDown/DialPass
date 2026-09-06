@@ -2,12 +2,33 @@
 
 from __future__ import annotations
 
+import pytest
+
 from dialpass.agent.classifier import ScriptedClassifier
 from dialpass.agent.session import AgentSession
 from dialpass.config import get_settings
+from dialpass.realtime.client import _parse_verdict
 from dialpass.realtime.fake import FakeTier2
 from dialpass.telemetry.publisher import CollectingSink
 from dialpass.testing import iter_frames, synthesize_call
+
+
+@pytest.mark.parametrize(
+    "reply, digit",
+    [
+        ('{"digit": "2", "rationale": "refund"}', "2"),
+        ('```json\n{"digit":"3","rationale":"x"}\n```', "3"),
+        ('<|vq_1|>{"digit":"0","rationale":"operator"}', "0"),
+        ('here you go {"digit":"5","rationale":"y"} thanks', "5"),
+        ('{"digit": "", "rationale": "no option fits"}', ""),
+        ("null", ""),
+        ("Sorry, I can't help with that.", ""),
+        ("You should press 4 for billing.", "4"),
+        ("Say 'representative' to reach an agent.", "0"),
+    ],
+)
+def test_parse_verdict_is_robust_to_chatty_model_output(reply, digit):
+    assert _parse_verdict(reply)[0] == digit
 
 
 class RecordingDtmfSender:

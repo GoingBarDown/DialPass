@@ -40,13 +40,16 @@ def _menu_instructions(goal: str | None) -> str:
         f"The caller's goal: {goal}." if goal else "The caller wants to reach a human agent."
     )
     return (
-        f"You are a DTMF dialer for a phone menu (IVR). {goal_line}\n"
+        f"You are a DTMF dialer for a phone menu (IVR). {goal_line} "
+        "The caller speaks English.\n"
         "You are given a recording of what the line just said. Pick the keypad "
         "key whose spoken option best matches the goal. If an option is phrased "
         "'<description> or press N' and the description fits, use N. Prefer an "
-        "agent / representative / operator option when nothing matches better. "
-        'If no stated option fits, or none were given (it asks you to speak, or '
-        'it is hold music / an after-hours message), use "".\n'
+        "agent / representative / operator option when nothing matches better.\n"
+        "Language prompts: choose the English option. If English is the default "
+        '(e.g. "for French press 2" with no key for English), use "".\n'
+        'Also use "" if no stated option fits, or none were given (it asks you '
+        "to speak, or it is hold music / an after-hours message).\n"
         "Output EXACTLY ONE LINE of JSON and NOTHING else — no prose, no code "
         "fences, never ask a question:\n"
         '{"digit": "<0-9, * or #, or empty>", "rationale": "<=12 words>"}'

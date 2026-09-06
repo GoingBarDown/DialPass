@@ -20,6 +20,10 @@ class Settings(BaseSettings):
     classifier_interval_ms: int = 500
     buffer_seconds: float = 12.0
     classify_window_ms: int = 1500
+    # Wait this long after a menu is detected before waking Tier 2, so it hears
+    # more of the prompt (fast-answering IVRs talk before the FSM catches up).
+    # Kept short: a long delay misses brief menus that flip to hold music.
+    menu_collect_s: float = 2.0
 
     # Telephony (M2+)
     twilio_account_sid: str = ""

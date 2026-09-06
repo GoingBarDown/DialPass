@@ -65,6 +65,10 @@ class AgentSession:
         self._samples_seen = 0
         self._next_classify_at = 0.0
         self.finished = False
+        # A menu wake is deferred by `menu_collect_s` so Tier 2 hears the whole
+        # prompt — fast-answering IVRs start talking before the FSM even reaches
+        # IVR_MENU. None = nothing pending.
+        self._menu_wake_due: float | None = None
 
     # -- properties -------------------------------------------------------
     @property
@@ -84,6 +88,16 @@ class AgentSession:
         self._samples_seen += int(pcm.size)
 
         interval = self.settings.classifier_interval_ms / 1000.0
+        # If we fell far behind — e.g. a blocking Tier 2 call froze ingestion for
+        # seconds — don't replay a burst of ticks on near-identical buffer
+        # contents (that manufactures a fake streak and stampedes the FSM). Skip
+        # to the latest window and carry on.
+        if self.audio_seconds - self._next_classify_at > 3 * interval:
+            skipped = self.audio_seconds - interval - self._next_classify_at
+            self._next_classify_at = self.audio_seconds - interval
+            log.warning(
+                "call %s: classifier fell %.1fs behind, skipping ahead", self.call_id, skipped
+            )
         while self.audio_seconds >= self._next_classify_at:
             self._run_tick(self._next_classify_at)
             self._next_classify_at += interval
@@ -112,12 +126,19 @@ class AgentSession:
         self._emit_state_change(before, now)
         self._dispatch(action, now)
 
+        # fire a deferred menu wake once its collect window has elapsed (and
+        # we're still in a menu — a hold/hangup in the meantime cancels it)
+        if self._menu_wake_due is not None and now >= self._menu_wake_due:
+            self._menu_wake_due = None
+            if self.fsm.state == CallState.IVR_MENU:
+                self._handle_menu(now)
+
     # -- FSM action dispatch -------------------------------------------
     def _dispatch(self, action: Action, now: float) -> None:
         if action == Action.NONE:
             return
         if action == Action.WAKE_TIER2_MENU:
-            self._handle_menu(now)
+            self._menu_wake_due = now + self.settings.menu_collect_s
         elif action == Action.WAKE_TIER2_PROBE:
             self._handle_probe(now)
         elif action == Action.BRIDGE:

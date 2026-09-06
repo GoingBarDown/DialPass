@@ -14,18 +14,23 @@ def feed(sm: CallStateMachine, label: Label, n: int, *, t0: float = 0.0, conf: f
     return result
 
 
+def enter_menu(sm: CallStateMachine, *, t0: float = 0.0) -> Action:
+    """Drive DIALING -> IVR_MENU with enough sustained menu speech."""
+    return feed(sm, Label.MENU_SPEAKING, sm.cfg.enter_menu_frames, t0=t0)
+
+
 def test_ringback_then_speech_enters_menu():
     sm = CallStateMachine()
     feed(sm, Label.RINGBACK, 5)
     assert sm.state == CallState.DIALING
-    action = feed(sm, Label.MENU_SPEAKING, 3, t0=5)
+    action = enter_menu(sm, t0=5)
     assert sm.state == CallState.IVR_MENU
     assert action == Action.WAKE_TIER2_MENU
 
 
 def test_single_frame_blip_does_not_transition():
     sm = CallStateMachine()
-    feed(sm, Label.MENU_SPEAKING, 3)  # -> IVR_MENU
+    enter_menu(sm)
     feed(sm, Label.HOLD_MUSIC, 3, t0=10)  # -> ON_HOLD
     assert sm.state == CallState.ON_HOLD
     # one stray speech frame must not arm EVALUATING_SPEECH
@@ -35,7 +40,7 @@ def test_single_frame_blip_does_not_transition():
 
 def test_low_confidence_frames_do_not_advance_streak():
     sm = CallStateMachine()
-    feed(sm, Label.MENU_SPEAKING, 3)
+    enter_menu(sm)
     feed(sm, Label.HOLD_MUSIC, 3, t0=10)
     for i in range(10):
         sm.observe(Label.LIVE_SPEECH_CANDIDATE, 0.3, 20 + i)  # below min_confidence
@@ -44,7 +49,7 @@ def test_low_confidence_frames_do_not_advance_streak():
 
 def test_speech_on_hold_triggers_probe_then_bridge():
     sm = CallStateMachine()
-    feed(sm, Label.MENU_SPEAKING, 3)
+    enter_menu(sm)
     feed(sm, Label.HOLD_MUSIC, 3, t0=10)
     action = feed(sm, Label.LIVE_SPEECH_CANDIDATE, 2, t0=20)
     assert sm.state == CallState.EVALUATING_SPEECH
@@ -57,7 +62,7 @@ def test_speech_on_hold_triggers_probe_then_bridge():
 def test_failed_probe_falls_back_and_refractory_blocks_immediate_retry():
     cfg = FsmConfig(refractory_s=18.0)
     sm = CallStateMachine(cfg)
-    feed(sm, Label.MENU_SPEAKING, 3)
+    enter_menu(sm)
     feed(sm, Label.HOLD_MUSIC, 3, t0=10)
     feed(sm, Label.LIVE_SPEECH_CANDIDATE, 2, t0=20)
     sm.probe_result(is_human=False, now=22)
@@ -76,7 +81,7 @@ def test_failed_probe_falls_back_and_refractory_blocks_immediate_retry():
 def test_evaluating_speech_leaves_only_after_sustained_hold():
     cfg = FsmConfig(leave_eval_frames=5)
     sm = CallStateMachine(cfg)
-    feed(sm, Label.MENU_SPEAKING, 3)
+    enter_menu(sm)
     feed(sm, Label.HOLD_MUSIC, 3, t0=10)
     feed(sm, Label.LIVE_SPEECH_CANDIDATE, 2, t0=20)
     assert sm.state == CallState.EVALUATING_SPEECH
@@ -88,7 +93,7 @@ def test_evaluating_speech_leaves_only_after_sustained_hold():
 
 def test_voicemail_fails_from_any_state():
     sm = CallStateMachine()
-    feed(sm, Label.MENU_SPEAKING, 3)
+    enter_menu(sm)
     action = feed(sm, Label.VOICEMAIL, 2, t0=5)
     assert sm.state == CallState.FAILED
     assert action == Action.FAIL
@@ -96,7 +101,7 @@ def test_voicemail_fails_from_any_state():
 
 def test_hold_can_loop_back_to_menu():
     sm = CallStateMachine()
-    feed(sm, Label.MENU_SPEAKING, 3)
+    enter_menu(sm)
     feed(sm, Label.HOLD_MUSIC, 3, t0=10)
     action = feed(sm, Label.MENU_SPEAKING, 3, t0=20)
     assert sm.state == CallState.IVR_MENU
@@ -106,7 +111,7 @@ def test_hold_can_loop_back_to_menu():
 def test_continuous_menu_narration_does_not_re_press():
     """One long prompt read without a pause must not re-wake Tier 2."""
     sm = CallStateMachine()
-    feed(sm, Label.LIVE_SPEECH_CANDIDATE, 3)  # DIALING -> IVR_MENU
+    feed(sm, Label.LIVE_SPEECH_CANDIDATE, sm.cfg.enter_menu_frames)  # DIALING -> IVR_MENU
     sm.note_menu_action(now=2.0)  # pressed a digit
     # speech just keeps going, no gap -> no second wake
     assert feed(sm, Label.LIVE_SPEECH_CANDIDATE, 20, t0=10) == Action.NONE
@@ -115,7 +120,7 @@ def test_continuous_menu_narration_does_not_re_press():
 def test_submenu_rewakes_tier2_after_gap_then_speech():
     cfg = FsmConfig(menu_refractory_s=6.0)
     sm = CallStateMachine(cfg)
-    feed(sm, Label.LIVE_SPEECH_CANDIDATE, 3)  # DIALING -> IVR_MENU
+    feed(sm, Label.LIVE_SPEECH_CANDIDATE, sm.cfg.enter_menu_frames)  # DIALING -> IVR_MENU
     assert sm.state == CallState.IVR_MENU
     sm.note_menu_action(now=5.0)  # pressed a digit
 

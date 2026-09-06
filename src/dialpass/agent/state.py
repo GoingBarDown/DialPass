@@ -66,7 +66,8 @@ class Action(StrEnum):
 
 @dataclass(slots=True)
 class FsmConfig:
-    enter_menu_frames: int = 3  # DIALING -> IVR_MENU
+    enter_menu_frames: int = 5  # DIALING -> IVR_MENU (~2.5s of speech; fast-answer
+    #                              IVRs otherwise wake Tier 2 before the menu speaks)
     enter_hold_frames: int = 3  # IVR_MENU -> ON_HOLD
     # DIALING -> ON_HOLD (line answered straight into a music queue). Higher than
     # enter_hold_frames: from DIALING a short stretch of music-like audio is more

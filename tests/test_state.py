@@ -101,3 +101,32 @@ def test_hold_can_loop_back_to_menu():
     action = feed(sm, Label.MENU_SPEAKING, 3, t0=20)
     assert sm.state == CallState.IVR_MENU
     assert action == Action.WAKE_TIER2_MENU
+
+
+def test_continuous_menu_narration_does_not_re_press():
+    """One long prompt read without a pause must not re-wake Tier 2."""
+    sm = CallStateMachine()
+    feed(sm, Label.LIVE_SPEECH_CANDIDATE, 3)  # DIALING -> IVR_MENU
+    sm.note_menu_action(now=2.0)  # pressed a digit
+    # speech just keeps going, no gap -> no second wake
+    assert feed(sm, Label.LIVE_SPEECH_CANDIDATE, 20, t0=10) == Action.NONE
+
+
+def test_submenu_rewakes_tier2_after_gap_then_speech():
+    cfg = FsmConfig(menu_refractory_s=6.0)
+    sm = CallStateMachine(cfg)
+    feed(sm, Label.LIVE_SPEECH_CANDIDATE, 3)  # DIALING -> IVR_MENU
+    assert sm.state == CallState.IVR_MENU
+    sm.note_menu_action(now=5.0)  # pressed a digit
+
+    feed(sm, Label.SILENCE, sm.cfg.menu_gap_frames, t0=16)  # prompt ends (past refractory)
+    action = feed(sm, Label.LIVE_SPEECH_CANDIDATE, 3, t0=22)  # submenu starts
+    assert action == Action.WAKE_TIER2_MENU
+
+
+def test_dialing_hold_music_goes_straight_to_hold_only_when_sustained():
+    sm = CallStateMachine()
+    feed(sm, Label.HOLD_MUSIC, 4)  # a brief mis-scored patch: stays put
+    assert sm.state == CallState.DIALING
+    feed(sm, Label.HOLD_MUSIC, sm.cfg.dialing_to_hold_frames, t0=10)
+    assert sm.state == CallState.ON_HOLD

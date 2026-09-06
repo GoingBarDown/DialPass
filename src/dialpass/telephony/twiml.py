@@ -10,13 +10,39 @@ from xml.sax.saxutils import escape
 
 def stream_and_conference(stream_url: str, conference_name: str) -> str:
     """Leg A (outbound to the business): fork audio to our media WebSocket, then
-    drop into the shared conference."""
+    drop into the shared conference. The conference name rides along as a Stream
+    <Parameter> so the media handler gets it in the `start` event (it needs it to
+    redirect the call for DTMF in M4)."""
     return (
         '<?xml version="1.0" encoding="UTF-8"?>'
         "<Response>"
         "<Start>"
-        f'<Stream url="{escape(stream_url)}" track="inbound_track"/>'
+        f'<Stream url="{escape(stream_url)}" track="inbound_track">'
+        f'<Parameter name="conference" value="{escape(conference_name)}"/>'
+        "</Stream>"
         "</Start>"
+        "<Dial>"
+        f'<Conference startConferenceOnEnter="true" endConferenceOnExit="true">'
+        f"{escape(conference_name)}</Conference>"
+        "</Dial>"
+        "</Response>"
+    )
+
+
+def play_digits_then_conference(digits: str, conference_name: str) -> str:
+    """M4 DTMF injection. Redirect target for `calls(sid).update()`: play the
+    touch-tones toward the far end, then drop back into the conference.
+
+    The `w`s are Twilio's 0.5s pauses — a lead-in so the first tone isn't clipped
+    by the redirect, and a tail so tones aren't rushed. The `<Start><Stream>`
+    from the original TwiML survives this redirect (verified), so it isn't
+    re-added here.
+    """
+    safe_digits = "".join(c for c in digits if c in "0123456789*#w")
+    return (
+        '<?xml version="1.0" encoding="UTF-8"?>'
+        "<Response>"
+        f'<Play digits="ww{escape(safe_digits)}w"/>'
         "<Dial>"
         f'<Conference startConferenceOnEnter="true" endConferenceOnExit="true">'
         f"{escape(conference_name)}</Conference>"

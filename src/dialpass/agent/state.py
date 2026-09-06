@@ -12,7 +12,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from enum import StrEnum
 
-from .labels import HOLD_LABELS, MENU_LABELS, NON_CONNECT_LABELS, Label
+from .labels import HOLD_LABELS, MENU_LABELS, NON_CONNECT_LABELS, SPEECHY_LABELS, Label
 
 # --- key terms -----------------------------------------------------------
 # streak       — how many consecutive ticks in a row have produced the same
@@ -68,10 +68,20 @@ class Action(StrEnum):
 class FsmConfig:
     enter_menu_frames: int = 3  # DIALING -> IVR_MENU
     enter_hold_frames: int = 3  # IVR_MENU -> ON_HOLD
+    # DIALING -> ON_HOLD (line answered straight into a music queue). Higher than
+    # enter_hold_frames: from DIALING a short stretch of music-like audio is more
+    # likely a smoothly-read greeting mis-scored than a real queue.
+    dialing_to_hold_frames: int = 6
     reenter_menu_frames: int = 3  # ON_HOLD -> IVR_MENU (menu loop)
     enter_eval_frames: int = 2  # ON_HOLD -> EVALUATING_SPEECH (easy, asymmetric)
     leave_eval_frames: int = 5  # EVALUATING_SPEECH -> ON_HOLD (hard, asymmetric)
     non_connect_frames: int = 2  # any live state -> FAILED
+    # After we press a digit, block re-waking Tier 2 for the next menu until the
+    # current prompt's tail has passed (~the tone + a beat). Then a submenu's
+    # speech re-wakes normally. See note_menu_action().
+    menu_refractory_s: float = 10.0
+    menu_gap_frames: int = 4  # non-speech run that counts as "the prompt ended"
+    max_menu_presses: int = 6  # safety rail: stop navigating after this many
     # Block re-EVALUATING after a failed probe. We enter EVALUATING ~2s into an
     # interjection, so ~8s covers the tail of a typical one. A rare long
     # announcement gets re-probed once (cheap). M3: let strong evidence
@@ -89,6 +99,12 @@ class CallStateMachine:
         self._streak = 0  # how many consecutive ticks _streak_label has held
         self._refractory_until = 0.0  # timestamp before which we ignore probe-worthy speech
         self._menu_woken = False  # have we already asked Tier 2 to read THIS menu?
+        self._menu_refractory_until = 0.0  # earliest a submenu may re-wake Tier 2
+        # A submenu only re-wakes Tier 2 once we've heard the previous prompt END
+        # (a non-speech gap). Without this, one long continuous menu reading keeps
+        # re-triggering because the speech never stops.
+        self._menu_gap_seen = False
+        self._menu_presses = 0  # count of digits pressed this call (safety cap)
 
     # -- streak bookkeeping -------------------------------------------------
     def _streak_for(self, label: Label, confidence: float) -> int:
@@ -119,6 +135,7 @@ class CallStateMachine:
         self._streak = 0
         if state == CallState.IVR_MENU:
             self._menu_woken = False
+            self._menu_gap_seen = False
 
     def _fall_back_to_hold(self, now: float) -> None:
         """Retreat to ON_HOLD after a failed probe, starting the refractory
@@ -166,6 +183,17 @@ class CallStateMachine:
         self._fall_back_to_hold(now)
         return Action.NONE
 
+    def note_menu_action(self, now: float) -> None:
+        """session.py calls this right after a digit is pressed. A submenu is a
+        *new* menu Tier 2 must read, but it only counts once we've heard the
+        prompt we just answered END — so clear the gap flag and hold re-wake off
+        for `menu_refractory_s` (covers the tone + the tail of that prompt)."""
+        if self.state == CallState.IVR_MENU:
+            self._menu_presses += 1
+            self._menu_woken = False
+            self._menu_gap_seen = False
+            self._menu_refractory_until = now + self.cfg.menu_refractory_s
+
     def bridged(self) -> None:
         """session.py calls this once it has started the handoff (told Tier 2
         to stall the rep). Moves HUMAN_DETECTED -> BRIDGING."""
@@ -202,22 +230,33 @@ class CallStateMachine:
             self._enter(CallState.IVR_MENU)
             self._menu_woken = True  # this transition already wakes Tier 2
             return Action.WAKE_TIER2_MENU
-        if label == Label.HOLD_MUSIC and streak >= self.cfg.enter_hold_frames:
+        if label == Label.HOLD_MUSIC and streak >= self.cfg.dialing_to_hold_frames:
             self._enter(CallState.ON_HOLD)
             return Action.NONE
         return Action.NONE
 
     def _on_ivr_menu(self, label: Label, streak: int, now: float) -> Action:
-        """A menu is currently playing/was just read. Two exits: sustained
-        hold music means the menu finished and we were placed on hold ->
-        ON_HOLD. Otherwise, if menu speech is still going and we haven't
-        woken Tier 2 for *this* menu yet, wake it now (handles menus that
-        weren't caught by the DIALING->IVR_MENU transition, e.g. a second
-        sub-menu)."""
+        """A menu is playing / was just read. Exits: sustained hold music ->
+        ON_HOLD (menu done, we were queued). Otherwise re-wake Tier 2 when a
+        *new* prompt starts — meaning we've heard the previous one END (a
+        non-speech gap) and speech has resumed. Continuous menu narration
+        without a gap does NOT re-trigger."""
         if label == Label.HOLD_MUSIC and streak >= self.cfg.enter_hold_frames:
             self._enter(CallState.ON_HOLD)
             return Action.NONE
-        if label in MENU_LABELS and not self._menu_woken and streak >= 2:
+
+        # the current prompt ended — a submenu (if any) can now re-wake us
+        if label in HOLD_LABELS and streak >= self.cfg.menu_gap_frames:
+            self._menu_gap_seen = True
+
+        if (
+            label in SPEECHY_LABELS
+            and self._menu_gap_seen
+            and now >= self._menu_refractory_until
+            and streak >= 2
+            and self._menu_presses < self.cfg.max_menu_presses
+        ):
+            self._menu_gap_seen = False
             self._menu_woken = True
             return Action.WAKE_TIER2_MENU
         return Action.NONE

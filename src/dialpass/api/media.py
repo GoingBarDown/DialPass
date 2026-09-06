@@ -24,6 +24,19 @@ router = APIRouter()
 log = logging.getLogger("dialpass.media")
 
 
+def _make_dtmf_sender(app, call_id: str, conference: str | None):
+    """Closure the session calls to press a digit. None (no-op) unless Twilio is
+    configured and we know the conference to rejoin after the DTMF redirect."""
+    twilio_client = app.state.twilio_client
+    if twilio_client is None or not conference:
+        return None
+
+    def send(digits: str) -> None:
+        twilio_client.send_dtmf(call_id, digits, conference)
+
+    return send
+
+
 @router.websocket("/media")
 async def media_stream(ws: WebSocket) -> None:
     await ws.accept()
@@ -42,7 +55,9 @@ async def media_stream(ws: WebSocket) -> None:
                 start = msg.get("start", {})
                 call_id = start.get("callSid") or start.get("streamSid") or "unknown"
                 goal = app.state.pending_goals.pop(call_id, None)
-                session = app.state.make_session(call_id, goal=goal)
+                conference = (start.get("customParameters") or {}).get("conference")
+                dtmf_sender = _make_dtmf_sender(app, call_id, conference)
+                session = app.state.make_session(call_id, goal=goal, dtmf_sender=dtmf_sender)
                 app.state.sessions[call_id] = session
                 if settings.record_dir:
                     recorder = WavRecorder(

@@ -18,7 +18,10 @@ from .telephony.twilio_client import TwilioClient
 
 def _build_tier2(settings):
     if settings.openai_api_key:
-        return RealtimeClient(settings.openai_api_key, settings.realtime_model)
+        return RealtimeClient(
+            settings.openai_api_key,
+            menu_model=settings.realtime_menu_model or settings.realtime_model,
+        )
     return FakeTier2()  # no key -> offline Tier 2, so the server still runs
 
 
@@ -40,7 +43,11 @@ def create_app() -> FastAPI:
     app.state.pending_goals = {}  # call_sid -> goal, set by /calls, consumed by /media
     app.state.twilio_client = _build_twilio_client(settings)
 
-    def make_session(call_id: str, goal: str | None = None) -> AgentSession:
+    def make_session(
+        call_id: str,
+        goal: str | None = None,
+        dtmf_sender=None,
+    ) -> AgentSession:
         return AgentSession(
             call_id,
             HeuristicClassifier(),
@@ -48,6 +55,7 @@ def create_app() -> FastAPI:
             telemetry=LogSink(),
             settings=settings,
             goal=goal,
+            dtmf_sender=dtmf_sender,
         )
 
     app.state.make_session = make_session

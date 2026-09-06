@@ -12,6 +12,7 @@ those to `telephony/`.
 from __future__ import annotations
 
 import logging
+from collections.abc import Callable
 
 import numpy as np
 
@@ -46,6 +47,7 @@ class AgentSession:
         settings: Settings | None = None,
         fsm_config: FsmConfig | None = None,
         goal: str | None = None,
+        dtmf_sender: Callable[[str], None] | None = None,
     ) -> None:
         self.call_id = call_id
         self.settings = settings or get_settings()
@@ -53,6 +55,9 @@ class AgentSession:
         self.tier2 = tier2
         self.telemetry = telemetry or NullSink()
         self.goal = goal
+        # Presses digits on the live call. Injected so agent/ stays vendor-free;
+        # the media handler wires the Twilio-backed one. No-op offline.
+        self.dtmf_sender: Callable[[str], None] = dtmf_sender or (lambda digits: None)
 
         self.fsm = CallStateMachine(fsm_config)
         self.buffer = RollingBuffer(self.settings.buffer_seconds, self.settings.sample_rate)
@@ -131,8 +136,14 @@ class AgentSession:
             self._fail(now, reason="tier2_not_implemented")
             return
         if decision.digits:
+            try:
+                self.dtmf_sender(decision.digits)
+            except Exception:
+                # A failed keypress shouldn't kill the call — Tier 1 keeps
+                # listening, and the menu will re-prompt on no input.
+                log.exception("call %s: DTMF send failed", self.call_id)
             self.telemetry.emit(DtmfSent(call_id=self.call_id, t=now, digits=decision.digits))
-            # M4: synthesize dual-tone PCM and inject into the outbound stream.
+            self.fsm.note_menu_action(now)  # re-arm the wake for a submenu
 
     def _handle_probe(self, now: float) -> None:
         self.telemetry.emit(Tier2Woken(call_id=self.call_id, t=now, reason="probe"))

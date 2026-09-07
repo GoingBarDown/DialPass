@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import base64
+import time
 
 import numpy as np
 
@@ -48,31 +49,38 @@ def test_inbound_ulaw_reaches_the_session_as_pcm():
     assert session.telemetry.of_kind("frame_classified")
 
 
-def test_press_dtmf_plays_tones_as_media_frames():
+def _press_and_wait(bridge: CallBridge, digits: str) -> list[str]:
+    got: list[str] = []
+    bridge.dtmf_redirect = got.append
+    bridge.press_dtmf(digits)
+    for _ in range(100):
+        if got:
+            break
+        time.sleep(0.005)
+    return got
+
+
+def test_press_dtmf_redirects_with_real_telephony_dtmf_and_flags_reconnect():
     bridge = CallBridge("grp", _session())
     bridge.bind_agent("MZ42")
-    bridge.press_dtmf("2#")
-
-    msgs = bridge.drain_outbound()
-    assert msgs and all(m["event"] == "media" for m in msgs)
-    assert all(m["streamSid"] == "MZ42" for m in msgs)
-    # lead-in + two 250/150ms digits ~= 1.0s of audio -> ~50 frames of 20ms
-    total = sum(len(base64.b64decode(m["media"]["payload"])) for m in msgs)
-    assert 6000 < total < 12000  # µ-law bytes ~= samples at 8 kHz
-    assert bridge.drain_outbound() == []  # consumed
+    assert _press_and_wait(bridge, "2#") == ["2#"]
+    assert bridge.reconnecting is True
+    assert bridge.drain_outbound() == []  # no audio path for DTMF
 
 
 def test_press_dtmf_strips_non_dtmf_characters():
     bridge = CallBridge("grp", _session())
     bridge.bind_agent("MZ1")
-    bridge.press_dtmf("2; DROP TABLE--1")
-    assert bridge.drain_outbound()  # only 2 and 1 survive, still produces tones
+    assert _press_and_wait(bridge, "2; DROP TABLE--1") == ["21"]
 
 
 def test_press_dtmf_before_bind_is_dropped():
     bridge = CallBridge("grp", _session())
+    got: list[str] = []
+    bridge.dtmf_redirect = got.append
     bridge.press_dtmf("2")
-    assert bridge.drain_outbound() == []
+    time.sleep(0.05)
+    assert got == [] and bridge.reconnecting is False
 
 
 def test_play_to_agent_splits_into_20ms_frames():
@@ -121,19 +129,12 @@ def test_run_probe_tees_inbound_audio_and_returns_the_verdict(monkeypatch):
     assert bridge._probe_inbound is None  # cleaned up
 
 
-def test_menu_digit_from_tier2_is_played_into_the_call_as_tones():
+def test_menu_digit_from_tier2_triggers_a_dtmf_redirect():
     session = _session()
     bridge = CallBridge("grp", session)
     bridge.bind_agent("MZ9")
-
-    pressed: list[str] = []
-    real_press = bridge.press_dtmf
-
-    def spy(digits: str) -> None:
-        pressed.append(digits)
-        real_press(digits)
-
-    session.dtmf_sender = spy
+    redirected: list[str] = []
+    bridge.dtmf_redirect = redirected.append
 
     pcm, _ = synthesize_call()
     ulaw = pcm16_to_ulaw(pcm)
@@ -142,5 +143,9 @@ def test_menu_digit_from_tier2_is_played_into_the_call_as_tones():
         if session.finished:
             break
 
-    assert pressed == ["2"]  # FakeTier2's fixed digit reached press_dtmf
-    assert any(m["event"] == "media" for m in bridge.drain_outbound())  # tones queued
+    for _ in range(100):
+        if redirected:
+            break
+        time.sleep(0.005)
+    assert redirected == ["2"]  # FakeTier2's fixed digit, via the redirect path
+    assert bridge.reconnecting is True

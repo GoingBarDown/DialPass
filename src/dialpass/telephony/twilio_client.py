@@ -35,6 +35,23 @@ class TwilioClient:
         call = self._client.calls.create(to=user_number, from_=self._from_number, url=twiml_url)
         return PlacedCall(call_sid=call.sid, conference_name=conference_name)
 
+    def press_digits(self, call_sid: str, digits: str, reconnect_url: str) -> None:
+        """Send real telephony DTMF, then reconnect the media stream.
+
+        Audio tones injected over a Media Stream aren't recognized by IVRs —
+        Twilio only converts in-band DTMF to signalling at the PSTN edge. So we
+        briefly redirect the leg to `<Play digits>` (Twilio generates the tones
+        at the telephony layer) and then `<Redirect>` back to the TwiML that
+        re-opens `<Connect><Stream>`. The stream drops for ~1-2s per keypress.
+        """
+        safe = "".join(c for c in digits if c in "0123456789*#w")
+        twiml = (
+            '<?xml version="1.0" encoding="UTF-8"?>'
+            f'<Response><Play digits="w{safe}"/><Pause length="1"/>'
+            f"<Redirect>{reconnect_url}</Redirect></Response>"
+        )
+        self._client.calls(call_sid).update(twiml=twiml)
+
     def hang_up(self, call_sid: str) -> None:
         """End a call leg. Recovery path (M8) — e.g. drop Leg A if the user's
         gone and can't be re-reached."""

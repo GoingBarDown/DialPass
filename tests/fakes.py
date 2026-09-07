@@ -12,6 +12,7 @@ class FakeTwilioClient:
     def __init__(self, *, ring_user_raises: Exception | None = None) -> None:
         self.outbound: list[dict] = []
         self.user_rings: list[dict] = []
+        self.digit_presses: list[dict] = []
         self.hangups: list[str] = []
         self._ring_user_raises = ring_user_raises
 
@@ -30,6 +31,11 @@ class FakeTwilioClient:
             {"to": user_number, "url": twiml_url, "conference": conference_name}
         )
         return PlacedCall(call_sid="CAuser0001", conference_name=conference_name)
+
+    def press_digits(self, call_sid: str, digits: str, reconnect_url: str) -> None:
+        self.digit_presses.append(
+            {"sid": call_sid, "digits": digits, "reconnect_url": reconnect_url}
+        )
 
     def hang_up(self, call_sid: str) -> None:
         self.hangups.append(call_sid)

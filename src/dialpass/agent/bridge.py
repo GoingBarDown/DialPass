@@ -20,6 +20,8 @@ from __future__ import annotations
 import asyncio
 import base64
 import logging
+import threading
+from collections.abc import Callable
 from concurrent.futures import Future
 
 import numpy as np
@@ -27,7 +29,7 @@ import numpy as np
 from ..realtime.protocol import ProbeOutcome
 from ..realtime.stream import probe_exchange
 from ..telephony.audio import pcm16_to_ulaw, ulaw_to_pcm16
-from ..telephony.dtmf import dtmf_sequence
+from ..telephony.recorder import WavRecorder
 from .session import AgentSession
 
 log = logging.getLogger("dialpass.bridge")
@@ -48,6 +50,14 @@ class CallBridge:
         # Set while a probe is running: inbound call audio is teed here for the
         # streaming Realtime exchange (see realtime/stream.py).
         self._probe_inbound: asyncio.Queue[bytes] | None = None
+        # Presses `digits` as real telephony DTMF via a brief REST redirect
+        # (media.py wires the Twilio call). True from the moment we ask for that
+        # redirect until the stream reconnects — tells the closing socket not to
+        # tear the call down.
+        self.dtmf_redirect: Callable[[str], None] = lambda digits: None
+        self.reconnecting = False
+        # Dev-only WAV tee; survives DTMF reconnects (media.py owns the object).
+        self.recorder: WavRecorder | None = None
         # Wire the session's keypress path to us.
         session.dtmf_sender = self.press_dtmf
 
@@ -71,18 +81,18 @@ class CallBridge:
 
     # -- Leg A outbound ----------------------------------------------------
     def press_dtmf(self, digits: str) -> None:
-        """Play touch-tones into the call as audio. (Twilio's stream `dtmf`
-        message is inbound-only — the only way to send a key over a
-        `<Connect><Stream>` leg is the tone itself, as `media` frames.)"""
+        """Press `digits` on the far end. Not as stream audio — IVRs don't
+        detect that — but via a REST redirect to `<Play digits>`, which Twilio
+        renders as real telephony DTMF. The stream drops and reconnects."""
         safe = "".join(c for c in digits if c in "0123456789*#")
         if not safe or self.agent_stream_sid is None:
             return
-        # 250 ms tones / 150 ms gaps at a hot level — comfortably above what slow
-        # IVRs need — with a short lead-in so the first tone isn't clipped.
-        lead_in = np.zeros(1600, dtype=np.int16)  # 200 ms
-        tones = dtmf_sequence(safe, sample_rate=8000, tone_ms=250, gap_ms=150, amplitude=0.5)
-        self.play_to_agent(np.concatenate([lead_in, tones]))
-        log.info("bridge %s: playing DTMF tones for %s", self.group_id, safe)
+        log.info("bridge %s: pressing %s (redirect + reconnect)", self.group_id, safe)
+        self.reconnecting = True
+        # The Twilio REST call blocks ~100-300ms — keep it off the media loop.
+        threading.Thread(
+            target=self.dtmf_redirect, args=(safe,), daemon=True
+        ).start()
 
     def play_to_agent(self, pcm16: np.ndarray) -> None:
         """Queue PCM (mono int16, 8 kHz) to play into the business call, split
@@ -127,3 +137,5 @@ class CallBridge:
     # -- lifecycle -------------------------------------------------------
     def close(self) -> None:
         self.session.close()
+        if self.recorder is not None:
+            self.recorder.close()

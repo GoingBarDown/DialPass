@@ -81,7 +81,12 @@ def test_media_socket_navigates_a_menu_over_the_stream():
     states = [(e.payload()["frm"], e.payload()["to"]) for e in sink.of_kind("state_changed")]
     assert ("DIALING", "IVR_MENU") in states
     assert [e.payload()["digits"] for e in sink.of_kind("dtmf_sent")] == ["2"]
-    assert GROUP not in app.state.bridges  # cleaned up on stop
+    # the digit went out as a real telephony DTMF redirect, not stream audio
+    presses = app.state.twilio_client.digit_presses
+    assert [p["digits"] for p in presses] == ["2"]
+    assert presses[0]["reconnect_url"].endswith(f"/twiml/voice?group={GROUP}")
+    # bridge is held for the imminent reconnect (redirect stub never completes it)
+    assert app.state.bridges[GROUP].reconnecting is True
 
 
 def test_media_socket_ignores_a_user_leg_for_now():

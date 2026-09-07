@@ -109,9 +109,7 @@ async def probe_exchange(
                     )
                 )
                 await ws.send(
-                    json.dumps(
-                        {"type": "response.create", "response": {"instructions": _GREETING}}
-                    )
+                    json.dumps({"type": "response.create", "response": {"instructions": _GREETING}})
                 )
 
                 text: list[str] = []

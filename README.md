@@ -6,7 +6,9 @@ You give DialPass a business number and your number. It places the call, navigat
 the IVR menu, waits on hold, detects when a real agent picks up, bridges you into
 the live call, and buzzes your phone. You never listen to hold music.
 
-> Status: **M1 — skeleton + offline pipeline.** No real calls yet. See [Milestones](#milestones).
+> Status: **M7 done** — bidirectional audio engine, menu navigation, handoff, and an
+> SQS telemetry pipeline all built and unit-tested; live-proven through DTMF actuation.
+> M8 (resilience) next. See [Milestones](#milestones).
 
 ---
 
@@ -69,10 +71,10 @@ src/dialpass/
   agent/               session · state (FSM) · classifier (Tier 1) · labels
   telephony/           twilio_client · twiml · dtmf (tone synthesis) · audio (mu-law <-> PCM)
   realtime/            client (gpt-realtime-mini) · fake · protocol
-  telemetry/           events · publisher (log sink now, SQS in M7)
+  telemetry/           events · publisher (log sink) · sqs_sink (producer) · store (worker sink)
   resilience/          circuit_breaker
-  persistence/         db · models          (M6/M7)
-  workers/             telemetry_worker      (M7)
+  workers/             telemetry_worker      (SQS -> Postgres)
+  persistence/         db · models          (M6 — skipped)
 scripts/simulate_call.py   offline harness
 ```
 
@@ -103,12 +105,12 @@ make dev                     # http://localhost:8000/health
 | | | Status |
 | --- | --- | --- |
 | **M1** | Skeleton + offline harness | **done** |
-| **M2** | Real Twilio media stream in (outbound call, mu-law decode) | next |
-| **M3** | Tier 1 detection loop (real features, VAD, tone templates, local ASR) | — |
-| **M4** | Menu navigation (wake Tier 2, understand menu, press key via DTMF) | — |
-| **M5** | Human detection + bridge (probe, join user's leg, handoff, notify) | — |
-| **M6** | Per-destination database (cached IVR maps, interjection cadence) | — |
-| **M7** | Telemetry pipeline (SQS off the hot path → Postgres) | — |
-| **M8** | Resilience (circuit breaker around Tier 2, drop-recovery) | — |
+| **M2** | Real Twilio media stream in (outbound call, mu-law decode) | **done** |
+| **M3** | Tier 1 detection loop (real features, envelope stats, tuned on real calls) | **done** |
+| **M4** | Menu navigation (wake Tier 2, understand menu, press key via DTMF) | **done** |
+| **M5** | Bidirectional audio engine + handoff (streaming probe, LegA↔LegB relay, notify) | **done** |
+| **M6** | Per-destination database (cached IVR maps, interjection cadence) | skipped |
+| **M7** | Telemetry pipeline (SQS off the hot path → worker → Postgres) | **done** |
+| **M8** | Resilience (circuit breaker around Tier 2, drop-recovery, fallback) | next |
 
 Design rationale for every decision: [`docs/design-decisions.md`](docs/design-decisions.md).

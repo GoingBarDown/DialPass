@@ -116,9 +116,7 @@ class RealtimeClient:
         th.join(self._timeout_s + 5)
         return box.get("v")
 
-    async def _menu_turn(
-        self, audio: np.ndarray, sample_rate: int, goal: str | None
-    ) -> str | None:
+    async def _menu_turn(self, audio: np.ndarray, sample_rate: int, goal: str | None) -> str | None:
         """Push the buffered menu clip, get one text response back."""
         ulaw = pcm16_to_ulaw(np.asarray(audio, dtype=np.int16))
         async with connect(

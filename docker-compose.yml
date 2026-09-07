@@ -1,6 +1,39 @@
-# M1: just the app. localstack (SQS) + postgres get added in M7 when the
-# telemetry pipeline lands.
+# Full local stack for the M7 telemetry pipeline:
+#   app  --(SqsSink, non-blocking)-->  SQS (localstack)  --(long poll)-->  worker  -->  Postgres
+#
+#   docker compose up            # everything
+#   docker compose up app        # just the API (falls back to the log sink if SQS is down)
 services:
+  localstack:
+    image: localstack/localstack:3
+    ports:
+      - "4566:4566"
+    environment:
+      SERVICES: sqs
+      AWS_DEFAULT_REGION: us-east-1
+    volumes:
+      - ./scripts/localstack-init.sh:/etc/localstack/init/ready.d/init.sh:ro
+    healthcheck:
+      # the init script writes this queue; healthy only once it exists
+      test: ["CMD-SHELL", "awslocal sqs get-queue-url --queue-name dialpass-telemetry"]
+      interval: 5s
+      timeout: 5s
+      retries: 15
+
+  postgres:
+    image: postgres:16-alpine
+    ports:
+      - "5432:5432"
+    environment:
+      POSTGRES_USER: dialpass
+      POSTGRES_PASSWORD: dialpass
+      POSTGRES_DB: dialpass
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U dialpass"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
   app:
     build: .
     ports:
@@ -10,3 +43,29 @@ services:
     environment:
       DIALPASS_HOST: 0.0.0.0
       DIALPASS_PORT: "8000"
+      DIALPASS_SQS_QUEUE_URL: http://localstack:4566/000000000000/dialpass-telemetry
+      DIALPASS_AWS_ENDPOINT_URL: http://localstack:4566
+      DIALPASS_AWS_REGION: us-east-1
+      AWS_ACCESS_KEY_ID: test
+      AWS_SECRET_ACCESS_KEY: test
+    depends_on:
+      localstack:
+        condition: service_healthy
+
+  worker:
+    build: .
+    command: ["uv", "run", "--no-dev", "python", "-m", "dialpass.workers.telemetry_worker"]
+    env_file:
+      - .env
+    environment:
+      DIALPASS_SQS_QUEUE_URL: http://localstack:4566/000000000000/dialpass-telemetry
+      DIALPASS_AWS_ENDPOINT_URL: http://localstack:4566
+      DIALPASS_AWS_REGION: us-east-1
+      DIALPASS_DATABASE_URL: postgresql://dialpass:dialpass@postgres:5432/dialpass
+      AWS_ACCESS_KEY_ID: test
+      AWS_SECRET_ACCESS_KEY: test
+    depends_on:
+      localstack:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy

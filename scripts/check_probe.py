@@ -87,7 +87,7 @@ async def main(fixture: str) -> None:
                     "response": {
                         "instructions": (
                             "Say just this and nothing more, in a calm voice: "
-                            "\"Hi, this is an assistant calling — is someone there?\""
+                            '"Hi, this is an assistant calling — is someone there?"'
                         )
                     },
                 }

@@ -42,8 +42,7 @@ def join_twiml(request: Request, group: str = Query(...)) -> Response:
         group,
         "user",
         intro=(
-            "This is DialPass. Stay on the line — I'll connect you the moment "
-            "someone picks up."
+            "This is DialPass. Stay on the line — I'll connect you the moment someone picks up."
         ),
     )
     return Response(content=xml, media_type="application/xml")

@@ -34,6 +34,14 @@ class Settings(BaseSettings):
     # Dev aid for M3 classifier tuning; leave blank in production.
     record_dir: str = ""
 
+    # Telemetry pipeline (M7). Blank sqs_queue_url -> events go to the log sink
+    # (no AWS needed for `make sim` or a bare dev server).
+    sqs_queue_url: str = ""
+    aws_region: str = "us-east-1"
+    aws_endpoint_url: str = ""  # localstack in docker-compose; blank = real AWS
+    telemetry_queue_maxsize: int = 10_000
+    database_url: str = ""  # telemetry worker's Postgres DSN; blank -> log events
+
     # Realtime / Tier 2 (M4+)
     openai_api_key: str = ""
     realtime_model: str = "gpt-realtime-mini"

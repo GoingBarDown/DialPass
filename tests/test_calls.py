@@ -52,6 +52,11 @@ def test_calls_records_the_user_leg_for_the_handoff():
     assert group.startswith("dialpass-")
     # the user's number is stashed for the handoff SMS
     assert app.state.user_numbers[group] == BODY["user_number"]
+    # and the business number, so a dropped agent leg can be re-dialed (M8)
+    assert app.state.call_meta[group] == {
+        "business_number": BODY["business_number"],
+        "redials": 0,
+    }
 
 
 def test_calls_survives_a_failed_user_ring():

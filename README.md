@@ -6,9 +6,10 @@ You give DialPass a business number and your number. It places the call, navigat
 the IVR menu, waits on hold, detects when a real agent picks up, bridges you into
 the live call, and buzzes your phone. You never listen to hold music.
 
-> Status: **M7 done** — bidirectional audio engine, menu navigation, handoff, and an
-> SQS telemetry pipeline all built and unit-tested; live-proven through DTMF actuation.
-> M8 (resilience) next. See [Milestones](#milestones).
+> Status: **M1–M8 built** (M6 skipped) — bidirectional audio engine, two-tier
+> detection, menu navigation, handoff, SQS telemetry pipeline, and resilience
+> (circuit breaker + drop recovery + fallback). All unit-tested; live-proven
+> through DTMF actuation. See [Milestones](#milestones).
 
 ---
 
@@ -111,6 +112,6 @@ make dev                     # http://localhost:8000/health
 | **M5** | Bidirectional audio engine + handoff (streaming probe, LegA↔LegB relay, notify) | **done** |
 | **M6** | Per-destination database (cached IVR maps, interjection cadence) | skipped |
 | **M7** | Telemetry pipeline (SQS off the hot path → worker → Postgres) | **done** |
-| **M8** | Resilience (circuit breaker around Tier 2, drop-recovery, fallback) | next |
+| **M8** | Resilience (circuit breaker around Tier 2, drop-recovery, fallback) | **done** |
 
 Design rationale for every decision: [`docs/design-decisions.md`](docs/design-decisions.md).

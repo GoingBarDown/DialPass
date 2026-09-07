@@ -59,6 +59,8 @@ def create_call(req: CallRequest, request: Request) -> CallAccepted:
     placed = twilio_client.place_outbound_call(req.business_number, voice_url, group)
 
     app.state.pending_goals[group] = req.goal
+    # Kept for the whole call so a dropped agent leg can be re-dialed (M8).
+    app.state.call_meta[group] = {"business_number": req.business_number, "redials": 0}
 
     # Leg B: ring the user now; they connect to our media socket (role=user) and
     # wait there until the handoff opens the relay. A failure here doesn't sink

@@ -42,6 +42,12 @@ class Settings(BaseSettings):
     telemetry_queue_maxsize: int = 10_000
     database_url: str = ""  # telemetry worker's Postgres DSN; blank -> log events
 
+    # Resilience (M8). The breaker trips after this many consecutive Tier 2
+    # infra failures and fails calls fast (-> fallback SMS) until it half-opens.
+    tier2_failure_threshold: int = 4
+    tier2_reset_timeout_s: float = 45.0
+    bridge_reap_interval_s: float = 10.0
+
     # Realtime / Tier 2 (M4+)
     openai_api_key: str = ""
     realtime_model: str = "gpt-realtime-mini"

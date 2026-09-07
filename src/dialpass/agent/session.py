@@ -21,6 +21,8 @@ from collections.abc import Callable
 import numpy as np
 
 from ..config import Settings, get_settings
+from ..realtime.protocol import Tier2Unavailable
+from ..resilience.circuit_breaker import CircuitBreaker, CircuitOpenError
 from ..telemetry.events import (
     BridgeStarted,
     CallCompleted,
@@ -41,6 +43,15 @@ from .state import Action, CallState, CallStateMachine, FsmConfig
 log = logging.getLogger("dialpass.agent")
 
 
+class HandoffUnavailable(RuntimeError):
+    """`on_bridge` raises this when a human was found but the handoff can't
+    happen (e.g. the user hung up). `reason` picks the fallback message."""
+
+    def __init__(self, reason: str) -> None:
+        super().__init__(reason)
+        self.reason = reason
+
+
 class AgentSession:
     def __init__(
         self,
@@ -54,6 +65,7 @@ class AgentSession:
         goal: str | None = None,
         dtmf_sender: Callable[[str], None] | None = None,
         tier2_executor: Tier2Executor | None = None,
+        tier2_breaker: CircuitBreaker | None = None,
         conference: str | None = None,
         user_leg_sid: str | None = None,
     ) -> None:
@@ -74,6 +86,12 @@ class AgentSession:
         # the user, open the Leg A <-> Leg B audio relay. Injected by the bridge
         # so agent/ stays vendor-free; no-op offline.
         self.on_bridge: Callable[[], None] = lambda: None
+        # Called from `_fail` with the reason. The bridge wires this to a fallback
+        # SMS so a failed call notifies the user instead of stranding them.
+        self.on_fail: Callable[[str], None] = lambda reason: None
+        # Guards the Realtime API. Shared across calls in production (one call's
+        # outage protects the next); a fresh one keeps the sim / tests isolated.
+        self._breaker = tier2_breaker or CircuitBreaker()
         # Runs the blocking Tier 2 calls. InlineExecutor (default) keeps the sim
         # and tests deterministic; the live handler passes a ThreadedExecutor.
         self._tier2_exec: Tier2Executor = tier2_executor or InlineExecutor()
@@ -178,14 +196,16 @@ class AgentSession:
         self._tier2_kind = "menu"
         snap = self.buffer.snapshot()
         sr, goal = self.settings.sample_rate, self.goal
-        self._tier2_exec.submit(lambda: self.tier2.choose_menu_digit(snap, sr, goal))
+        self._tier2_exec.submit(
+            lambda: self._breaker.call(self.tier2.choose_menu_digit, snap, sr, goal)
+        )
 
     def _start_probe(self, now: float) -> None:
         self.telemetry.emit(Tier2Woken(call_id=self.call_id, t=now, reason="probe"))
         self._tier2_kind = "probe"
         snap = self.buffer.snapshot()
         sr = self.settings.sample_rate
-        self._tier2_exec.submit(lambda: self.tier2.probe(snap, sr))
+        self._tier2_exec.submit(lambda: self._breaker.call(self.tier2.probe, snap, sr))
 
     def _poll_tier2(self, now: float) -> None:
         if self._tier2_kind is None:
@@ -199,6 +219,19 @@ class AgentSession:
             if isinstance(error, NotImplementedError):
                 # A stubbed Tier 2 (probe lands in M5) — don't crash a live call.
                 self._fail(now, reason="tier2_not_implemented")
+            elif isinstance(error, CircuitOpenError):
+                # The breaker has tripped — Tier 2 is out for a while. No point
+                # sitting on the call; route to the fallback notification.
+                log.warning("call %s: tier2 %s rejected — circuit open", self.call_id, kind)
+                self._fail(now, reason="tier2_unavailable")
+            elif isinstance(error, Tier2Unavailable):
+                # One infra failure (timeout / transport). The breaker counted it.
+                # A probe we can't run means we can't confirm a human — bail. A
+                # menu we can't read is survivable: Tier 1 keeps listening and the
+                # next prompt re-wakes Tier 2.
+                log.warning("call %s: tier2 %s unavailable — %s", self.call_id, kind, error)
+                if kind == "probe":
+                    self._fail(now, reason="tier2_unavailable")
             else:
                 log.error("call %s: tier2 %s failed", self.call_id, kind, exc_info=error)
                 if kind == "probe":
@@ -234,6 +267,10 @@ class AgentSession:
             # Speak the holding line, text the user, open the audio relay. The
             # bridge does this asynchronously; this call just kicks it off.
             self.on_bridge()
+        except HandoffUnavailable as exc:
+            log.warning("call %s: handoff unavailable (%s)", self.call_id, exc.reason)
+            self._fail(now, reason=exc.reason)
+            return
         except Exception:
             log.exception("call %s: handoff failed to start", self.call_id)
             self._fail(now, reason="handoff_error")
@@ -252,6 +289,18 @@ class AgentSession:
     def _fail(self, now: float, reason: str) -> None:
         self.telemetry.emit(CallFailed(call_id=self.call_id, t=now, reason=reason))
         self.finished = True
+        try:
+            self.on_fail(reason)
+        except Exception:
+            log.exception("call %s: on_fail hook raised", self.call_id)
+
+    def abort(self, reason: str) -> None:
+        """External kill switch — the transport layer calls this when something
+        outside the label stream ends the call (the user hung up, the leg
+        dropped). Routes through the same failure path as an internal `_fail`."""
+        if self.finished:
+            return
+        self._fail(self.audio_seconds, reason)
 
     def close(self) -> None:
         """Release the Tier 2 executor's thread. Called when the media stream

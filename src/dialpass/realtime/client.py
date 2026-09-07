@@ -27,7 +27,7 @@ import numpy as np
 from websockets.asyncio.client import connect
 
 from ..telephony.audio import pcm16_to_ulaw
-from .protocol import MenuDecision, ProbeOutcome
+from .protocol import MenuDecision, ProbeOutcome, Tier2Unavailable
 
 log = logging.getLogger("dialpass.realtime")
 
@@ -79,7 +79,9 @@ class RealtimeClient:
     ) -> MenuDecision:
         text = self._run(self._menu_turn(audio, sample_rate, goal))
         if text is None:
-            return MenuDecision(None, rationale="tier2 unavailable (timeout or error)")
+            # Infra failure (timeout / transport / error event), not an abstain —
+            # let the circuit breaker count it.
+            raise Tier2Unavailable("menu exchange failed (timeout or error)")
         log.debug("menu model reply: %s", text.replace("\n", " ")[:300])
         digits, rationale = _parse_verdict(text)
         if digits and not set(digits) <= _VALID_DIGITS:

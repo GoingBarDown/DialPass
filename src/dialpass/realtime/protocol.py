@@ -23,6 +23,13 @@ class MenuDecision:
 class ProbeOutcome:
     is_human: bool
     transcript: str = ""
+    ok: bool = True  # False = the exchange itself failed (timeout / transport), not a real read
+
+
+class Tier2Unavailable(RuntimeError):
+    """The Realtime API call failed as infrastructure (timeout, transport, error
+    event) rather than returning a usable answer. The circuit breaker counts
+    these; a plain abstain (`MenuDecision(None)`, not-human verdict) does not."""
 
 
 class Tier2(Protocol):

@@ -27,6 +27,7 @@ import numpy as np
 from ..realtime.protocol import ProbeOutcome
 from ..realtime.stream import probe_exchange
 from ..telephony.audio import pcm16_to_ulaw, ulaw_to_pcm16
+from ..telephony.dtmf import dtmf_sequence
 from .session import AgentSession
 
 log = logging.getLogger("dialpass.bridge")
@@ -70,15 +71,18 @@ class CallBridge:
 
     # -- Leg A outbound ----------------------------------------------------
     def press_dtmf(self, digits: str) -> None:
-        """Send touch-tones to the far end over the stream — no REST redirect,
-        so the socket never drops (Twilio bidirectional `dtmf` event)."""
-        safe = "".join(c for c in digits if c in "0123456789*#w")
+        """Play touch-tones into the call as audio. (Twilio's stream `dtmf`
+        message is inbound-only — the only way to send a key over a
+        `<Connect><Stream>` leg is the tone itself, as `media` frames.)"""
+        safe = "".join(c for c in digits if c in "0123456789*#")
         if not safe or self.agent_stream_sid is None:
             return
-        self._outbound.append(
-            {"event": "dtmf", "streamSid": self.agent_stream_sid, "dtmf": {"digits": safe}}
-        )
-        log.info("bridge %s: queued DTMF %s", self.group_id, safe)
+        # 250 ms tones / 150 ms gaps at a hot level — comfortably above what slow
+        # IVRs need — with a short lead-in so the first tone isn't clipped.
+        lead_in = np.zeros(1600, dtype=np.int16)  # 200 ms
+        tones = dtmf_sequence(safe, sample_rate=8000, tone_ms=250, gap_ms=150, amplitude=0.5)
+        self.play_to_agent(np.concatenate([lead_in, tones]))
+        log.info("bridge %s: playing DTMF tones for %s", self.group_id, safe)
 
     def play_to_agent(self, pcm16: np.ndarray) -> None:
         """Queue PCM (mono int16, 8 kHz) to play into the business call, split

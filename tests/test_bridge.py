@@ -48,14 +48,25 @@ def test_inbound_ulaw_reaches_the_session_as_pcm():
     assert session.telemetry.of_kind("frame_classified")
 
 
-def test_press_dtmf_queues_a_twilio_dtmf_event():
+def test_press_dtmf_plays_tones_as_media_frames():
     bridge = CallBridge("grp", _session())
     bridge.bind_agent("MZ42")
-    bridge.press_dtmf("2w3")
+    bridge.press_dtmf("2#")
 
-    (msg,) = bridge.drain_outbound()
-    assert msg == {"event": "dtmf", "streamSid": "MZ42", "dtmf": {"digits": "2w3"}}
+    msgs = bridge.drain_outbound()
+    assert msgs and all(m["event"] == "media" for m in msgs)
+    assert all(m["streamSid"] == "MZ42" for m in msgs)
+    # lead-in + two 250/150ms digits ~= 1.0s of audio -> ~50 frames of 20ms
+    total = sum(len(base64.b64decode(m["media"]["payload"])) for m in msgs)
+    assert 6000 < total < 12000  # µ-law bytes ~= samples at 8 kHz
     assert bridge.drain_outbound() == []  # consumed
+
+
+def test_press_dtmf_strips_non_dtmf_characters():
+    bridge = CallBridge("grp", _session())
+    bridge.bind_agent("MZ1")
+    bridge.press_dtmf("2; DROP TABLE--1")
+    assert bridge.drain_outbound()  # only 2 and 1 survive, still produces tones
 
 
 def test_press_dtmf_before_bind_is_dropped():
@@ -110,10 +121,19 @@ def test_run_probe_tees_inbound_audio_and_returns_the_verdict(monkeypatch):
     assert bridge._probe_inbound is None  # cleaned up
 
 
-def test_menu_digit_flows_from_tier2_through_the_bridge_to_a_dtmf_event():
+def test_menu_digit_from_tier2_is_played_into_the_call_as_tones():
     session = _session()
     bridge = CallBridge("grp", session)
     bridge.bind_agent("MZ9")
+
+    pressed: list[str] = []
+    real_press = bridge.press_dtmf
+
+    def spy(digits: str) -> None:
+        pressed.append(digits)
+        real_press(digits)
+
+    session.dtmf_sender = spy
 
     pcm, _ = synthesize_call()
     ulaw = pcm16_to_ulaw(pcm)
@@ -122,5 +142,5 @@ def test_menu_digit_flows_from_tier2_through_the_bridge_to_a_dtmf_event():
         if session.finished:
             break
 
-    dtmf = [m for m in bridge.drain_outbound() if m["event"] == "dtmf"]
-    assert [m["dtmf"]["digits"] for m in dtmf] == ["2"]
+    assert pressed == ["2"]  # FakeTier2's fixed digit reached press_dtmf
+    assert any(m["event"] == "media" for m in bridge.drain_outbound())  # tones queued

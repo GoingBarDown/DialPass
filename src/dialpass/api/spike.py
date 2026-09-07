@@ -58,6 +58,26 @@ async def spike_call(request: Request) -> dict:
     return {"call_sid": call.call_sid}
 
 
+@router.post("/dev-call")
+async def dev_call(request: Request) -> dict:
+    """Place only Leg A (the agent call) — no user leg, no second ring. Body:
+    {"to": "+1...", "goal": "..."}. For testing the agent path by hand."""
+    import uuid
+
+    app = request.app
+    tw = app.state.twilio_client
+    settings = app.state.settings
+    if tw is None or not settings.public_base_url:
+        return {"error": "twilio not configured"}
+    body = await request.json()
+    group = f"dialpass-{uuid.uuid4().hex[:12]}"
+    app.state.pending_goals[group] = body.get("goal")
+    call = tw.place_outbound_call(
+        body["to"], f"{settings.public_base_url}/twiml/voice?group={group}", group
+    )
+    return {"call_sid": call.call_sid, "group": group}
+
+
 @router.api_route("/twiml/spike-bidi", methods=["GET", "POST"])
 def spike_twiml(request: Request) -> Response:
     url = _media_ws_url(request.app.state.settings.public_base_url)

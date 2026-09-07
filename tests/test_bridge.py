@@ -77,6 +77,39 @@ def test_play_to_agent_splits_into_20ms_frames():
     assert len(base64.b64decode(msgs[2]["media"]["payload"])) == 80
 
 
+def test_run_probe_tees_inbound_audio_and_returns_the_verdict(monkeypatch):
+    import asyncio
+
+    import dialpass.agent.bridge as bridge_mod
+    from dialpass.realtime.protocol import ProbeOutcome
+
+    heard: list[bytes] = []
+
+    async def fake_exchange(api_key, model, *, inbound, play, **kw):
+        for _ in range(3):
+            heard.append(await inbound.get())
+        play(np.zeros(160, dtype=np.int16))  # "greeting" into the call
+        return ProbeOutcome(is_human=True, transcript="hello there")
+
+    monkeypatch.setattr(bridge_mod, "probe_exchange", fake_exchange)
+    bridge = CallBridge("grp", _session())
+    bridge.bind_agent("MZ1")
+
+    async def drive():
+        task = asyncio.create_task(bridge.run_probe())
+        for _ in range(5):
+            await asyncio.sleep(0)
+            bridge.on_agent_audio(b"\xff" * 160)
+        return await task
+
+    outcome = asyncio.run(drive())
+
+    assert outcome.is_human is True
+    assert len(heard) == 3
+    assert any(m["event"] == "media" for m in bridge.drain_outbound())  # greeting queued
+    assert bridge._probe_inbound is None  # cleaned up
+
+
 def test_menu_digit_flows_from_tier2_through_the_bridge_to_a_dtmf_event():
     session = _session()
     bridge = CallBridge("grp", session)

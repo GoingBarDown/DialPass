@@ -17,11 +17,15 @@ a plain object with sync methods so it's trivial to unit-test.
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import logging
+from concurrent.futures import Future
 
 import numpy as np
 
+from ..realtime.protocol import ProbeOutcome
+from ..realtime.stream import probe_exchange
 from ..telephony.audio import pcm16_to_ulaw, ulaw_to_pcm16
 from .session import AgentSession
 
@@ -35,19 +39,31 @@ class CallBridge:
         self.group_id = group_id
         self.session = session
         self.agent_stream_sid: str | None = None
+        self._loop: asyncio.AbstractEventLoop | None = None
         # Ready-to-serialize Twilio outbound messages toward Leg A. The media
         # socket's write task drains this. Unbounded: DTMF is rare and AI audio
         # is paced by the model, so it can't run away.
         self._outbound: list[dict] = []
+        # Set while a probe is running: inbound call audio is teed here for the
+        # streaming Realtime exchange (see realtime/stream.py).
+        self._probe_inbound: asyncio.Queue[bytes] | None = None
         # Wire the session's keypress path to us.
         session.dtmf_sender = self.press_dtmf
 
     # -- Leg A inbound -------------------------------------------------------
-    def bind_agent(self, stream_sid: str) -> None:
+    def bind_agent(self, stream_sid: str, loop: asyncio.AbstractEventLoop | None = None) -> None:
         self.agent_stream_sid = stream_sid
+        self._loop = loop
+
+    def probe_from_thread(self) -> Future[ProbeOutcome]:
+        """Kick off `run_probe` on the media loop from the Tier 2 worker thread."""
+        assert self._loop is not None
+        return asyncio.run_coroutine_threadsafe(self.run_probe(), self._loop)
 
     def on_agent_audio(self, ulaw: bytes) -> None:
         """One 20 ms G.711 frame from the business call."""
+        if self._probe_inbound is not None:
+            self._probe_inbound.put_nowait(ulaw)
         if self.session.finished:
             return
         self.session.feed_audio(ulaw_to_pcm16(ulaw))
@@ -83,6 +99,26 @@ class CallBridge:
         """Hand the socket task everything queued since the last call."""
         out, self._outbound = self._outbound, []
         return out
+
+    # -- the probe (streaming Realtime exchange) --------------------------
+    async def run_probe(self) -> ProbeOutcome:
+        """Greet the line and classify the reply. Driven from the Tier 2 worker
+        thread via run_coroutine_threadsafe; runs here on the media loop so it
+        can both read inbound frames and play audio into the call."""
+        settings = self.session.settings
+        model = settings.realtime_menu_model or settings.realtime_model
+        self._probe_inbound = asyncio.Queue()
+        try:
+            outcome = await probe_exchange(
+                settings.openai_api_key,
+                model,
+                inbound=self._probe_inbound,
+                play=self.play_to_agent,
+            )
+        finally:
+            self._probe_inbound = None
+        log.info("bridge %s: probe -> %s", self.group_id, outcome)
+        return outcome
 
     # -- lifecycle -------------------------------------------------------
     def close(self) -> None:

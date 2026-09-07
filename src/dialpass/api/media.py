@@ -24,6 +24,7 @@ import logging
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
 
 from ..agent.bridge import CallBridge
+from ..realtime.stream import StreamingProbe
 from ..telephony.audio import ulaw_to_pcm16
 from ..telephony.recorder import WavRecorder
 
@@ -79,7 +80,12 @@ async def media_stream(ws: WebSocket) -> None:
                     user_leg_sid=user_leg_sid,
                 )
                 bridge = CallBridge(group, session)  # wires session.dtmf_sender
-                bridge.bind_agent(stream_sid)
+                bridge.bind_agent(stream_sid, asyncio.get_running_loop())
+                if settings.openai_api_key:
+                    # Swap the turn-based probe for the streaming one — it greets
+                    # the line and listens over a live Realtime socket. Menu
+                    # decisions still go to the wrapped client.
+                    session.tier2 = StreamingProbe(session.tier2, bridge.probe_from_thread)
                 app.state.bridges[group] = bridge
                 app.state.sessions[call_id] = session
                 writer = asyncio.create_task(_drain_outbound(ws, bridge))

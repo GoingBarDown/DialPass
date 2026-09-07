@@ -9,7 +9,7 @@ from fastapi import FastAPI
 from .agent.classifier import HeuristicClassifier
 from .agent.executor import ThreadedExecutor
 from .agent.session import AgentSession
-from .api import calls, health, media, voice
+from .api import calls, health, media, spike, voice
 from .config import get_settings
 from .realtime.client import RealtimeClient
 from .realtime.fake import FakeTier2
@@ -71,6 +71,7 @@ def create_app() -> FastAPI:
     app.include_router(calls.router)
     app.include_router(media.router)
     app.include_router(voice.router)
+    app.include_router(spike.router)  # M5 spike — remove with api/spike.py
     return app
 
 

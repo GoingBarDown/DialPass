@@ -1,6 +1,6 @@
 from xml.etree import ElementTree as ET
 
-from dialpass.telephony.twiml import connect_stream, join_conference
+from dialpass.telephony.twiml import connect_stream
 
 
 def test_connect_stream_is_a_bidirectional_pipe_with_group_and_role():
@@ -20,8 +20,11 @@ def test_connect_stream_escapes_parameters():
     ET.fromstring(xml)  # would raise if the & / quotes weren't escaped
 
 
-def test_join_conference_muted_flag():
-    xml = join_conference("room-abc", muted=True)
-    conf = ET.fromstring(xml).find(".//Conference")
-    assert conf.attrib["muted"] == "true"
-    assert conf.attrib["startConferenceOnEnter"] == "false"
+def test_connect_stream_intro_is_spoken_before_the_stream():
+    xml = connect_stream("wss://x/media", "dialpass-abc", "user", intro="Stay on the line.")
+    root = ET.fromstring(xml)
+    kids = list(root)
+    assert kids[0].tag == "Say" and kids[0].text == "Stay on the line."
+    assert kids[1].tag == "Connect"  # Say comes first, then the stream opens
+    params = {p.attrib["name"]: p.attrib["value"] for p in root.findall(".//Stream/Parameter")}
+    assert params == {"group": "dialpass-abc", "role": "user"}

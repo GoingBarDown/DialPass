@@ -1,18 +1,23 @@
-"""CallBridge — one outbound call's audio hub.
+"""CallBridge — one outbound call's audio hub and, at the handoff, its mixer.
 
 Since M2 the business call (Leg A) forked its audio to us one-way via
 `<Start><Stream>` and sat in a Twilio Conference. That can't work for the handoff:
 Twilio has no way to stream audio *into* a conference, so the AI could never
 speak to the rep and the bullet-1 "bidirectional audio engine" was a fiction.
 
-M5 replaces it. Leg A (and, in phase 3, the user's Leg B) connect over a
-bidirectional `<Connect><Stream>` WebSocket. This object is the hub both sockets
-attach to: it decodes Leg A's inbound audio into the `AgentSession` (Tier 1 + FSM
-unchanged) and owns the reverse path — DTMF and, later, the AI's synthesized
-speech — as a queue of ready-to-send Twilio messages the socket task drains.
+M5 replaces it. Leg A (the business call) and Leg B (the user's own phone) each
+connect over a bidirectional `<Connect><Stream>` WebSocket. This object is the
+hub both sockets attach to:
 
-The asyncio plumbing (read loop, write loop) lives in `api/media.py`; this stays
-a plain object with sync methods so it's trivial to unit-test.
+  * Leg A inbound audio -> `AgentSession` (Tier 1 + FSM unchanged), and it is
+    teed to the probe while one is running.
+  * Leg A / Leg B outbound audio -> per-leg queues the socket write tasks drain.
+  * On `Action.BRIDGE` (human confirmed) `begin_handoff` speaks a holding line
+    into Leg A, texts the user, and flips `relay_open` — from then on every Leg A
+    frame is copied to Leg B and vice versa, so the two people talk directly.
+
+The asyncio plumbing (read loops, write loops) lives in `api/media.py`; this
+stays a plain object with sync methods so it's trivial to unit-test.
 """
 
 from __future__ import annotations
@@ -27,7 +32,7 @@ from concurrent.futures import Future
 import numpy as np
 
 from ..realtime.protocol import ProbeOutcome
-from ..realtime.stream import probe_exchange
+from ..realtime.stream import probe_exchange, speak_exchange
 from ..telephony.audio import pcm16_to_ulaw, ulaw_to_pcm16
 from ..telephony.recorder import WavRecorder
 from .session import AgentSession
@@ -36,17 +41,22 @@ log = logging.getLogger("dialpass.bridge")
 
 _FRAME = 160  # samples / bytes per 20 ms G.711 frame at 8 kHz
 
+_AGENT_HOLD_LINE = "Thanks for holding — connecting my client now, one moment."
+_USER_SMS = "DialPass reached a live agent — you're connected now. Go ahead and talk."
+
 
 class CallBridge:
     def __init__(self, group_id: str, session: AgentSession) -> None:
         self.group_id = group_id
         self.session = session
         self.agent_stream_sid: str | None = None
+        self.user_stream_sid: str | None = None
         self._loop: asyncio.AbstractEventLoop | None = None
-        # Ready-to-serialize Twilio outbound messages toward Leg A. The media
-        # socket's write task drains this. Unbounded: DTMF is rare and AI audio
-        # is paced by the model, so it can't run away.
-        self._outbound: list[dict] = []
+        # Ready-to-serialize Twilio outbound messages, one queue per leg. The
+        # media sockets' write tasks drain them. Unbounded: relayed audio is
+        # paced 1:1 by the far end and AI audio is paced by the model.
+        self._outbound_agent: list[dict] = []
+        self._outbound_user: list[dict] = []
         # Set while a probe is running: inbound call audio is teed here for the
         # streaming Realtime exchange (see realtime/stream.py).
         self._probe_inbound: asyncio.Queue[bytes] | None = None
@@ -56,30 +66,49 @@ class CallBridge:
         # tear the call down.
         self.dtmf_redirect: Callable[[str], None] = lambda digits: None
         self.reconnecting = False
+        # Texts the user (media.py wires the Twilio-backed one). No-op offline.
+        self.notify_user: Callable[[str], None] = lambda body: None
+        # False until the handoff: Leg A <-> Leg B audio is not relayed, Leg B
+        # hears only silence (its <Say> intro told it to wait).
+        self.relay_open = False
+        self._handoff_started = False
         # Dev-only WAV tee; survives DTMF reconnects (media.py owns the object).
         self.recorder: WavRecorder | None = None
-        # Wire the session's keypress path to us.
+        self._closed = False
+        # Wire the session's keypress and handoff hooks to us.
         session.dtmf_sender = self.press_dtmf
+        session.on_bridge = self.begin_handoff
 
-    # -- Leg A inbound -------------------------------------------------------
+    # -- leg binding -------------------------------------------------------
     def bind_agent(self, stream_sid: str, loop: asyncio.AbstractEventLoop | None = None) -> None:
         self.agent_stream_sid = stream_sid
         self._loop = loop
+
+    def bind_user(self, stream_sid: str) -> None:
+        self.user_stream_sid = stream_sid
 
     def probe_from_thread(self) -> Future[ProbeOutcome]:
         """Kick off `run_probe` on the media loop from the Tier 2 worker thread."""
         assert self._loop is not None
         return asyncio.run_coroutine_threadsafe(self.run_probe(), self._loop)
 
+    # -- inbound audio ---------------------------------------------------
     def on_agent_audio(self, ulaw: bytes) -> None:
         """One 20 ms G.711 frame from the business call."""
         if self._probe_inbound is not None:
             self._probe_inbound.put_nowait(ulaw)
-        if self.session.finished:
-            return
-        self.session.feed_audio(ulaw_to_pcm16(ulaw))
+        if self.relay_open and self.user_stream_sid is not None:
+            self._outbound_user.append(self._frame(self.user_stream_sid, ulaw))
+        if not self.session.finished:
+            self.session.feed_audio(ulaw_to_pcm16(ulaw))
 
-    # -- Leg A outbound ----------------------------------------------------
+    def on_user_audio(self, ulaw: bytes) -> None:
+        """One 20 ms G.711 frame from the user's phone. Discarded until the
+        handoff — before that the user is just waiting on our line."""
+        if self.relay_open and self.agent_stream_sid is not None:
+            self._outbound_agent.append(self._frame(self.agent_stream_sid, ulaw))
+
+    # -- outbound audio -------------------------------------------------
     def press_dtmf(self, digits: str) -> None:
         """Press `digits` on the far end. Not as stream audio — IVRs don't
         detect that — but via a REST redirect to `<Play digits>`, which Twilio
@@ -90,28 +119,30 @@ class CallBridge:
         log.info("bridge %s: pressing %s (redirect + reconnect)", self.group_id, safe)
         self.reconnecting = True
         # The Twilio REST call blocks ~100-300ms — keep it off the media loop.
-        threading.Thread(
-            target=self.dtmf_redirect, args=(safe,), daemon=True
-        ).start()
+        threading.Thread(target=self.dtmf_redirect, args=(safe,), daemon=True).start()
 
     def play_to_agent(self, pcm16: np.ndarray) -> None:
         """Queue PCM (mono int16, 8 kHz) to play into the business call, split
-        into 20 ms G.711 frames. Used by the probe / handoff line in phase 2b+."""
+        into 20 ms G.711 frames. Used by the probe greeting and the handoff line."""
         if self.agent_stream_sid is None:
             return
         ulaw = pcm16_to_ulaw(np.asarray(pcm16, dtype=np.int16))
         for i in range(0, len(ulaw), _FRAME):
-            self._outbound.append(
-                {
-                    "event": "media",
-                    "streamSid": self.agent_stream_sid,
-                    "media": {"payload": base64.b64encode(ulaw[i : i + _FRAME]).decode("ascii")},
-                }
-            )
+            self._outbound_agent.append(self._frame(self.agent_stream_sid, ulaw[i : i + _FRAME]))
 
-    def drain_outbound(self) -> list[dict]:
-        """Hand the socket task everything queued since the last call."""
-        out, self._outbound = self._outbound, []
+    def _frame(self, stream_sid: str, ulaw: bytes) -> dict:
+        return {
+            "event": "media",
+            "streamSid": stream_sid,
+            "media": {"payload": base64.b64encode(ulaw).decode("ascii")},
+        }
+
+    def drain_agent(self) -> list[dict]:
+        out, self._outbound_agent = self._outbound_agent, []
+        return out
+
+    def drain_user(self) -> list[dict]:
+        out, self._outbound_user = self._outbound_user, []
         return out
 
     # -- the probe (streaming Realtime exchange) --------------------------
@@ -134,8 +165,53 @@ class CallBridge:
         log.info("bridge %s: probe -> %s", self.group_id, outcome)
         return outcome
 
+    # -- the handoff ---------------------------------------------------
+    def begin_handoff(self) -> None:
+        """`AgentSession` calls this (on the media loop) the moment a human is
+        confirmed. Schedules the async handoff and returns immediately so the
+        FSM can finish its tick."""
+        if self._handoff_started:
+            return
+        self._handoff_started = True
+        settings = self.session.settings
+        if self._loop is None or not settings.openai_api_key:
+            # Nothing async to do — no holding line to synthesize (offline / no
+            # key) or no loop to run it on (unit tests). Open the relay now.
+            self.relay_open = True
+            self._safe_notify()
+            return
+        self._loop.create_task(self._do_handoff())
+
+    async def _do_handoff(self) -> None:
+        settings = self.session.settings
+        model = settings.realtime_menu_model or settings.realtime_model
+        try:
+            await speak_exchange(
+                settings.openai_api_key, model, _AGENT_HOLD_LINE, play=self.play_to_agent
+            )
+        except Exception:
+            log.exception("bridge %s: handoff holding line failed", self.group_id)
+        # Wait for the queued holding line to actually drain into the call before
+        # patching the two parties together, so they don't talk over our voice.
+        for _ in range(250):  # 5 s cap
+            if not self._outbound_agent:
+                break
+            await asyncio.sleep(0.02)
+        self.relay_open = True
+        self._safe_notify()
+        log.info("bridge %s: relay open — user and agent connected", self.group_id)
+
+    def _safe_notify(self) -> None:
+        try:
+            self.notify_user(_USER_SMS)
+        except Exception:
+            log.exception("bridge %s: user notification failed", self.group_id)
+
     # -- lifecycle -------------------------------------------------------
     def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
         self.session.close()
         if self.recorder is not None:
             self.recorder.close()

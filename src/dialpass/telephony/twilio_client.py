@@ -31,9 +31,16 @@ class TwilioClient:
         return PlacedCall(call_sid=call.sid, conference_name=conference_name)
 
     def ring_user(self, user_number: str, twiml_url: str, conference_name: str) -> PlacedCall:
-        """Dial the user's own phone (Leg B), joining the same conference muted."""
+        """Dial the user's own phone (Leg B). `twiml_url` connects them to our
+        media socket (role=user); they wait there until the handoff opens the
+        relay. `conference_name` is the group id, carried for bookkeeping."""
         call = self._client.calls.create(to=user_number, from_=self._from_number, url=twiml_url)
         return PlacedCall(call_sid=call.sid, conference_name=conference_name)
+
+    def send_sms(self, to_number: str, body: str) -> None:
+        """Fire-and-forget text — the handoff notification (M5 phase 3) and the
+        circuit-breaker fallback (M8)."""
+        self._client.messages.create(to=to_number, from_=self._from_number, body=body)
 
     def press_digits(self, call_sid: str, digits: str, reconnect_url: str) -> None:
         """Send real telephony DTMF, then reconnect the media stream.

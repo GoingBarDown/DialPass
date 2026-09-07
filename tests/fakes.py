@@ -14,6 +14,7 @@ class FakeTwilioClient:
         self.user_rings: list[dict] = []
         self.digit_presses: list[dict] = []
         self.hangups: list[str] = []
+        self.sms: list[dict] = []
         self._ring_user_raises = ring_user_raises
 
     def place_outbound_call(
@@ -39,3 +40,6 @@ class FakeTwilioClient:
 
     def hang_up(self, call_sid: str) -> None:
         self.hangups.append(call_sid)
+
+    def send_sms(self, to_number: str, body: str) -> None:
+        self.sms.append({"to": to_number, "body": body})

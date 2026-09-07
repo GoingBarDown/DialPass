@@ -169,6 +169,72 @@ async def probe_exchange(
         return ProbeOutcome(is_human=False, transcript="probe unavailable")
 
 
+_SPEAK_SYSTEM = (
+    "You are a text-to-speech voice for a call-routing assistant. When told to "
+    "say something, say exactly that once, calmly and naturally, then stop. "
+    "Never add words of your own and never wait for a reply."
+)
+
+
+async def speak_exchange(
+    api_key: str,
+    model: str,
+    text: str,
+    *,
+    play: Callable[[np.ndarray], None],
+    timeout_s: float = 12.0,
+) -> None:
+    """Speak `text` into the call once. Opens a Realtime session, streams the
+    synthesized audio to `play` (PCM mono int16, 8 kHz), closes. Best effort —
+    a failure here just means the far end hears a beat of silence before the
+    relay opens."""
+    try:
+        async with asyncio.timeout(timeout_s):
+            async with connect(
+                _URL.format(model=model),
+                additional_headers={"Authorization": f"Bearer {api_key}"},
+                max_size=None,
+            ) as ws:
+                await ws.send(
+                    json.dumps(
+                        {
+                            "type": "session.update",
+                            "session": {
+                                "type": "realtime",
+                                "instructions": _SPEAK_SYSTEM,
+                                "output_modalities": ["audio"],
+                                "audio": {
+                                    "output": {
+                                        "format": {"type": "audio/pcmu"},
+                                        "voice": "alloy",
+                                    }
+                                },
+                            },
+                        }
+                    )
+                )
+                await ws.send(
+                    json.dumps(
+                        {
+                            "type": "response.create",
+                            "response": {"instructions": f'Say exactly this, once: "{text}"'},
+                        }
+                    )
+                )
+                async for raw in ws:
+                    evt = json.loads(raw)
+                    et = evt.get("type", "")
+                    if et == "response.output_audio.delta":
+                        play(ulaw_to_pcm16(base64.b64decode(evt["delta"])))
+                    elif et in ("response.done", "response.output_audio.done"):
+                        break
+                    elif et == "error":
+                        log.warning("speak error event: %s", evt.get("error"))
+                        break
+    except (TimeoutError, OSError, ConnectionError) as exc:
+        log.warning("speak exchange failed: %s", exc)
+
+
 class StreamingProbe:
     """Wraps a turn-based Tier 2 so the probe streams. Menu decisions and the
     holding line pass straight through to `inner`. Satisfies the `Tier2` protocol."""

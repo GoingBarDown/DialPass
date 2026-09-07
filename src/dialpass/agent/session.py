@@ -70,6 +70,10 @@ class AgentSession:
         # Presses digits on the live call. Injected so agent/ stays vendor-free;
         # the media handler wires the Twilio-backed one. No-op offline.
         self.dtmf_sender: Callable[[str], None] = dtmf_sender or (lambda digits: None)
+        # Starts the handoff: speak a holding line into the business call, notify
+        # the user, open the Leg A <-> Leg B audio relay. Injected by the bridge
+        # so agent/ stays vendor-free; no-op offline.
+        self.on_bridge: Callable[[], None] = lambda: None
         # Runs the blocking Tier 2 calls. InlineExecutor (default) keeps the sim
         # and tests deterministic; the live handler passes a ThreadedExecutor.
         self._tier2_exec: Tier2Executor = tier2_executor or InlineExecutor()
@@ -227,16 +231,18 @@ class AgentSession:
     def _bridge(self, now: float) -> None:
         self.telemetry.emit(HumanDetected(call_id=self.call_id, t=now))
         try:
-            self.tier2.say_to_agent("Thanks for picking up — connecting my client now, one moment.")
-        except NotImplementedError:
-            self._fail(now, reason="tier2_not_implemented")
+            # Speak the holding line, text the user, open the audio relay. The
+            # bridge does this asynchronously; this call just kicks it off.
+            self.on_bridge()
+        except Exception:
+            log.exception("call %s: handoff failed to start", self.call_id)
+            self._fail(now, reason="handoff_error")
             return
         before = self.fsm.state
         self.fsm.bridged()
         self._emit_state_change(before, now)
         self.telemetry.emit(BridgeStarted(call_id=self.call_id, t=now))
-        # M5: notify the user, wait a beat, stop forwarding AI audio, unmute the
-        # user's conference leg.
+        # The relay carries the two parties from here; this session's job is done.
         before = self.fsm.state
         self.fsm.completed()
         self._emit_state_change(before, now)

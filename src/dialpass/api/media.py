@@ -1,15 +1,17 @@
 """WebSocket endpoint for Twilio Media Streams — the call's audio transport.
 
-Since M5 the business call (Leg A) connects over a bidirectional `<Connect><Stream>`
-(not the one-way `<Start><Stream>` + Conference of M2-M4). Twilio sends JSON text
-frames: `connected`, `start`, `media` (base64 G.711, 8 kHz, 20 ms), `mark`, `stop`;
-we send `media` back the same way. A `CallBridge` (see agent/bridge.py) is the hub
-— this module is the socket's read and write loops.
+Since M5 both legs connect over a bidirectional `<Connect><Stream>` (not the
+one-way `<Start><Stream>` + Conference of M2-M4). Twilio sends JSON text frames:
+`connected`, `start`, `media` (base64 G.711, 8 kHz, 20 ms), `mark`, `stop`; we
+send `media` back the same way. A `CallBridge` (see agent/bridge.py) is the hub —
+this module is the sockets' read and write loops.
 
 `start.customParameters` carries `group` (correlates a call's legs on our side)
-and `role` (`agent` = the business call; `user` = Leg B, wired in phase 3).
+and `role`: `agent` = the business call (drives Tier 1 + the FSM); `user` = Leg B,
+the user's own phone, which just attaches to the same bridge and waits for the
+handoff to open the relay.
 
-A keypress redirects the leg away and back (see CallBridge.press_dtmf), so a
+A keypress redirects the agent leg away and back (see CallBridge.press_dtmf), so a
 second `start` for a `group` that already has a bridge is a **reconnect** — reuse
 the session, just re-bind the new stream.
 
@@ -35,13 +37,19 @@ from ..telephony.recorder import WavRecorder
 router = APIRouter()
 log = logging.getLogger("dialpass.media")
 
+# How long a user leg waits for its agent leg's bridge to exist before giving up.
+# Leg A is an already-answered outbound call; Leg B is a human answering a cell,
+# so Leg A's bridge is almost always up first. 100 * 50 ms = 5 s of headroom.
+_USER_ATTACH_TRIES = 100
+_USER_ATTACH_INTERVAL = 0.05
 
-async def _drain_outbound(ws: WebSocket, bridge: CallBridge) -> None:
-    """Ship whatever the bridge has queued toward the call. Polls every 20 ms —
-    queued audio (AI speech, tones) paces itself frame by frame."""
+
+async def _drain_loop(ws: WebSocket, drain) -> None:
+    """Ship whatever the bridge has queued toward this leg. Polls every 20 ms —
+    queued audio (AI speech, relayed frames) paces itself frame by frame."""
     try:
         while True:
-            for msg in bridge.drain_outbound():
+            for msg in drain():
                 await ws.send_text(json.dumps(msg))
             await asyncio.sleep(0.02)
     except (WebSocketDisconnect, RuntimeError):
@@ -67,6 +75,57 @@ def _wire_dtmf(app, bridge: CallBridge, call_id: str, group: str) -> None:
     bridge.dtmf_redirect = press
 
 
+def _wire_notify(app, bridge: CallBridge, group: str) -> None:
+    """Give the bridge a way to text the user at handoff."""
+    twilio_client = app.state.twilio_client
+    number = app.state.user_numbers.pop(group, None)
+    if twilio_client is None or not number:
+        return
+
+    def notify(body: str) -> None:
+        try:
+            twilio_client.send_sms(number, body)
+        except Exception:
+            log.exception("media: handoff SMS failed for %s", group)
+
+    bridge.notify_user = notify
+
+
+async def _serve_user_leg(ws: WebSocket, app, group: str, stream_sid: str) -> None:
+    """Attach a user leg to its group's bridge and pump its audio until it drops.
+
+    The user leg never owns the call's lifetime — if it drops, the agent leg's
+    own disconnect (or M8's recovery) handles teardown; we just detach here."""
+    bridge = None
+    for _ in range(_USER_ATTACH_TRIES):
+        bridge = app.state.bridges.get(group)
+        if bridge is not None:
+            break
+        await asyncio.sleep(_USER_ATTACH_INTERVAL)
+    if bridge is None:
+        log.warning("media: user leg for group %s but no agent bridge — closing", group)
+        return
+
+    bridge.bind_user(stream_sid)
+    writer = asyncio.create_task(_drain_loop(ws, bridge.drain_user))
+    log.info("media: user leg connected, group %s", group)
+    try:
+        while True:
+            msg = json.loads(await ws.receive_text())
+            event = msg.get("event")
+            if event == "media":
+                bridge.on_user_audio(base64.b64decode(msg["media"]["payload"]))
+            elif event == "stop":
+                break
+    except WebSocketDisconnect:
+        log.info("media: user leg disconnected for group %s", group)
+    finally:
+        writer.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await writer
+        bridge.user_stream_sid = None
+
+
 @router.websocket("/media")
 async def media_stream(ws: WebSocket) -> None:
     await ws.accept()
@@ -89,10 +148,9 @@ async def media_stream(ws: WebSocket) -> None:
                 call_id = start.get("callSid") or "unknown"
                 stream_sid = start.get("streamSid") or ""
 
-                if role != "agent":
-                    # Leg B (the user) lands here in phase 3; nothing to do yet.
-                    log.info("media: %s leg for group %s — ignored pre-phase-3", role, group)
-                    continue
+                if role == "user":
+                    await _serve_user_leg(ws, app, group, stream_sid)
+                    break  # bridge stays None here — user leg never tears down the call
 
                 existing = app.state.bridges.get(group)
                 if existing is not None:
@@ -101,7 +159,7 @@ async def media_stream(ws: WebSocket) -> None:
                     recorder = bridge.recorder
                     bridge.bind_agent(stream_sid, asyncio.get_running_loop())
                     bridge.reconnecting = False
-                    writer = asyncio.create_task(_drain_outbound(ws, bridge))
+                    writer = asyncio.create_task(_drain_loop(ws, bridge.drain_agent))
                     log.info("media: agent leg reconnected, group %s", group)
                     continue
 
@@ -110,16 +168,17 @@ async def media_stream(ws: WebSocket) -> None:
                 session = app.state.make_session(
                     call_id, goal=goal, conference=group, user_leg_sid=user_leg_sid
                 )
-                bridge = CallBridge(group, session)  # wires session.dtmf_sender
+                bridge = CallBridge(group, session)  # wires session hooks
                 bridge.bind_agent(stream_sid, asyncio.get_running_loop())
                 _wire_dtmf(app, bridge, call_id, group)
+                _wire_notify(app, bridge, group)
                 if settings.openai_api_key:
                     # Swap the turn-based probe for the streaming one — it greets
                     # the line and listens over a live Realtime socket.
                     session.tier2 = StreamingProbe(session.tier2, bridge.probe_from_thread)
                 app.state.bridges[group] = bridge
                 app.state.sessions[call_id] = session
-                writer = asyncio.create_task(_drain_outbound(ws, bridge))
+                writer = asyncio.create_task(_drain_loop(ws, bridge.drain_agent))
 
                 if settings.record_dir:
                     recorder = WavRecorder(

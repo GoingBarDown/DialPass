@@ -60,13 +60,15 @@ def create_call(req: CallRequest, request: Request) -> CallAccepted:
 
     app.state.pending_goals[group] = req.goal
 
-    # Leg B: ring the user now, join them muted. A failure here doesn't sink the
-    # call — the agent can still navigate; the bridge just has no one to unmute
-    # (M8 turns that into a fallback notification).
-    join_url = f"{base}/twiml/join?conference={group}"
+    # Leg B: ring the user now; they connect to our media socket (role=user) and
+    # wait there until the handoff opens the relay. A failure here doesn't sink
+    # the call — the agent can still navigate; the bridge just has no one to
+    # patch in (M8 turns that into a fallback notification).
+    join_url = f"{base}/twiml/join?group={group}"
     try:
         user_leg = twilio_client.ring_user(req.user_number, join_url, group)
         app.state.user_legs[group] = user_leg.call_sid
+        app.state.user_numbers[group] = req.user_number
     except Exception:
         log.exception("call %s: failed to ring user leg %s", placed.call_sid, req.user_number)
 

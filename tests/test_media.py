@@ -25,7 +25,7 @@ from dialpass.testing import synthesize_call
 GROUP = "dialpass-testgroup1"
 
 
-def _app_with_capturing_session():
+def _app_with_capturing_session(*, probe_is_human: bool = False):
     app = create_app()
     app.state.twilio_client = FakeTwilioClient()
     app.state.settings.public_base_url = "https://dialpass.test"
@@ -38,7 +38,7 @@ def _app_with_capturing_session():
         return AgentSession(
             call_id,
             ScriptedClassifier(schedule),
-            FakeTier2(menu_digits="2", probe_is_human=False),
+            FakeTier2(menu_digits="2", probe_is_human=probe_is_human),
             telemetry=sink,
             settings=get_settings(),
             goal=goal,
@@ -89,9 +89,46 @@ def test_media_socket_navigates_a_menu_over_the_stream():
     assert app.state.bridges[GROUP].reconnecting is True
 
 
-def test_media_socket_ignores_a_user_leg_for_now():
+def test_media_socket_hands_off_to_the_user_when_a_human_is_detected():
+    app, sink = _app_with_capturing_session(probe_is_human=True)
+    app.state.user_numbers[GROUP] = "+15145550123"
+    pcm, _ = synthesize_call()
+    ulaw = pcm16_to_ulaw(pcm)
+
+    captured: list = []
+    with TestClient(app).websocket_connect("/media") as ws:
+        ws.send_json(_start())
+        for i in range(0, len(ulaw), 160):
+            ws.send_json(_frame(ulaw[i : i + 160]))
+            if not captured and GROUP in app.state.bridges:
+                captured.append(app.state.bridges[GROUP])
+        ws.send_json({"event": "stop"})
+
+    kinds = [e.payload()["kind"] for e in sink.events]
+    assert "human_detected" in kinds and "bridge_started" in kinds
+    assert [e.payload()["outcome"] for e in sink.of_kind("call_completed")] == ["human_bridged"]
+    # relay opened and the user got a text
+    assert captured[0].relay_open is True
+    assert [s["to"] for s in app.state.twilio_client.sms] == ["+15145550123"]
+
+
+def test_media_socket_attaches_a_user_leg_to_the_existing_bridge():
+    from dialpass.agent.bridge import CallBridge
+
     app, _ = _app_with_capturing_session()
+    session = app.state.make_session("CAtest")
+    bridge = CallBridge(GROUP, session)
+    bridge.bind_agent("MZagent")
+    bridge.relay_open = True  # pretend the handoff already happened
+    app.state.bridges[GROUP] = bridge
+
     with TestClient(app).websocket_connect("/media") as ws:
         ws.send_json(_start(role="user"))
+        for _ in range(5):
+            ws.send_json(_frame(b"\x30" * 160))
         ws.send_json({"event": "stop"})
-    assert GROUP not in app.state.bridges  # phase 3 wires the user leg
+
+    # the user's voice was relayed toward the agent leg
+    relayed = bridge.drain_agent()
+    assert relayed and all(m["streamSid"] == "MZagent" for m in relayed)
+    session.close()

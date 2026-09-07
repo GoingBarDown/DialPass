@@ -65,7 +65,7 @@ def test_press_dtmf_redirects_with_real_telephony_dtmf_and_flags_reconnect():
     bridge.bind_agent("MZ42")
     assert _press_and_wait(bridge, "2#") == ["2#"]
     assert bridge.reconnecting is True
-    assert bridge.drain_outbound() == []  # no audio path for DTMF
+    assert bridge.drain_agent() == []  # no audio path for DTMF
 
 
 def test_press_dtmf_strips_non_dtmf_characters():
@@ -88,7 +88,7 @@ def test_play_to_agent_splits_into_20ms_frames():
     bridge.bind_agent("MZ7")
     bridge.play_to_agent(np.zeros(400, dtype=np.int16))  # 50 ms -> 3 frames (160+160+80)
 
-    msgs = bridge.drain_outbound()
+    msgs = bridge.drain_agent()
     assert [m["event"] for m in msgs] == ["media", "media", "media"]
     assert all(m["streamSid"] == "MZ7" for m in msgs)
     # frames are base64 G.711; first two are full 160-byte frames
@@ -125,8 +125,52 @@ def test_run_probe_tees_inbound_audio_and_returns_the_verdict(monkeypatch):
 
     assert outcome.is_human is True
     assert len(heard) == 3
-    assert any(m["event"] == "media" for m in bridge.drain_outbound())  # greeting queued
+    assert any(m["event"] == "media" for m in bridge.drain_agent())  # greeting queued
     assert bridge._probe_inbound is None  # cleaned up
+
+
+def test_relay_is_closed_before_the_handoff():
+    bridge = CallBridge("grp", _session())
+    bridge.bind_agent("MZa")
+    bridge.bind_user("MZb")
+    # user talking while we're still navigating goes nowhere
+    bridge.on_user_audio(b"\xff" * 160)
+    assert bridge.drain_agent() == []
+
+
+def test_begin_handoff_opens_a_two_way_relay_and_notifies_the_user():
+    bridge = CallBridge("grp", _session())
+    bridge.bind_agent("MZa")  # no loop -> begin_handoff runs synchronously
+    bridge.bind_user("MZb")
+    texts: list[str] = []
+    bridge.notify_user = texts.append
+
+    bridge.begin_handoff()
+    assert bridge.relay_open is True
+    assert len(texts) == 1
+
+    bridge.on_user_audio(b"\x10" * 160)
+    bridge.on_agent_audio(b"\x20" * 160)
+    to_agent = bridge.drain_agent()
+    to_user = bridge.drain_user()
+    assert [m["streamSid"] for m in to_agent] == ["MZa"]  # user's voice -> agent leg
+    assert [m["streamSid"] for m in to_user] == ["MZb"]  # agent's voice -> user leg
+
+
+def test_begin_handoff_is_idempotent():
+    bridge = CallBridge("grp", _session())
+    bridge.bind_agent("MZa")
+    texts: list[str] = []
+    bridge.notify_user = texts.append
+    bridge.begin_handoff()
+    bridge.begin_handoff()
+    assert len(texts) == 1
+
+
+def test_session_bridge_hook_is_wired_to_begin_handoff():
+    session = _session()
+    bridge = CallBridge("grp", session)
+    assert session.on_bridge == bridge.begin_handoff
 
 
 def test_menu_digit_from_tier2_triggers_a_dtmf_redirect():

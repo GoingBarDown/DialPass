@@ -44,6 +44,7 @@ def create_app() -> FastAPI:
     app.state.bridges = {}  # group_id -> CallBridge, for the lifetime of each call
     app.state.pending_goals = {}  # group_id -> goal, set by /calls, consumed by /media
     app.state.user_legs = {}  # group_id -> user (Leg B) call_sid, for the handoff
+    app.state.user_numbers = {}  # group_id -> user phone, for the handoff SMS
     app.state.twilio_client = _build_twilio_client(settings)
 
     def make_session(

@@ -40,7 +40,7 @@ def test_calls_dials_both_legs_into_the_same_conference():
     assert leg_a["to"] == BODY["business_number"]
     assert leg_b["to"] == BODY["user_number"]
     assert leg_a["url"] == f"https://dialpass.test/twiml/voice?group={group}"
-    assert leg_b["url"] == f"https://dialpass.test/twiml/join?conference={group}"
+    assert leg_b["url"] == f"https://dialpass.test/twiml/join?group={group}"
 
 
 def test_calls_records_the_user_leg_for_the_handoff():
@@ -50,6 +50,8 @@ def test_calls_records_the_user_leg_for_the_handoff():
     assert list(app.state.user_legs.values()) == ["CAuser0001"]
     (group,) = app.state.user_legs
     assert group.startswith("dialpass-")
+    # the user's number is stashed for the handoff SMS
+    assert app.state.user_numbers[group] == BODY["user_number"]
 
 
 def test_calls_survives_a_failed_user_ring():
@@ -61,10 +63,14 @@ def test_calls_survives_a_failed_user_ring():
     assert app.state.user_legs == {}
 
 
-@pytest.mark.parametrize("path", ["/twiml/join?conference=room-xyz"])
-def test_join_twiml_route_returns_a_muted_conference(path):
-    r = TestClient(create_app()).get(path)
+@pytest.mark.parametrize("path", ["/twiml/join?group=dialpass-xyz"])
+def test_join_twiml_route_connects_the_user_leg_to_the_media_stream(path):
+    app = create_app()
+    app.state.settings.public_base_url = "https://dialpass.test"
+    r = TestClient(app).get(path)
     assert r.status_code == 200
-    assert 'muted="true"' in r.text
-    assert "room-xyz" in r.text
-    assert 'startConferenceOnEnter="false"' in r.text
+    assert "<Connect><Stream" in r.text.replace("\n", "")
+    assert "wss://dialpass.test/media" in r.text
+    assert 'value="dialpass-xyz"' in r.text and 'value="user"' in r.text
+    assert "<Conference" not in r.text
+    assert "Stay on the line" in r.text  # the intro is spoken before the stream

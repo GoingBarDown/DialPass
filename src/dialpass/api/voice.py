@@ -10,7 +10,7 @@ from __future__ import annotations
 
 from fastapi import APIRouter, Query, Request, Response
 
-from ..telephony.twiml import stream_and_conference
+from ..telephony.twiml import join_conference, stream_and_conference
 
 router = APIRouter()
 
@@ -26,6 +26,15 @@ def voice_twiml(request: Request, conference: str = Query(...)) -> Response:
     settings = request.app.state.settings
     stream_url = _media_ws_url(settings.public_base_url)
     xml = stream_and_conference(stream_url, conference)
+    return Response(content=xml, media_type="application/xml")
+
+
+@router.api_route("/twiml/join", methods=["GET", "POST"])
+def join_twiml(conference: str = Query(...)) -> Response:
+    """Leg B (the user's phone). Twilio fetches this when the user answers the
+    call DialPass placed to them; they join the conference muted and wait there
+    passively until the handoff unmutes them (M5 phase 3)."""
+    xml = join_conference(conference, muted=True)
     return Response(content=xml, media_type="application/xml")
 
 

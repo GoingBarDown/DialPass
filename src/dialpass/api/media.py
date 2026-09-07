@@ -56,8 +56,15 @@ async def media_stream(ws: WebSocket) -> None:
                 call_id = start.get("callSid") or start.get("streamSid") or "unknown"
                 goal = app.state.pending_goals.pop(call_id, None)
                 conference = (start.get("customParameters") or {}).get("conference")
+                user_leg_sid = app.state.user_legs.pop(call_id, None)
                 dtmf_sender = _make_dtmf_sender(app, call_id, conference)
-                session = app.state.make_session(call_id, goal=goal, dtmf_sender=dtmf_sender)
+                session = app.state.make_session(
+                    call_id,
+                    goal=goal,
+                    dtmf_sender=dtmf_sender,
+                    conference=conference,
+                    user_leg_sid=user_leg_sid,
+                )
                 app.state.sessions[call_id] = session
                 if settings.record_dir:
                     recorder = WavRecorder(

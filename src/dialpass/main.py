@@ -42,12 +42,15 @@ def create_app() -> FastAPI:
     app.state.settings = settings
     app.state.sessions = {}
     app.state.pending_goals = {}  # call_sid -> goal, set by /calls, consumed by /media
+    app.state.user_legs = {}  # agent call_sid -> user (Leg B) call_sid, for the handoff unmute
     app.state.twilio_client = _build_twilio_client(settings)
 
     def make_session(
         call_id: str,
         goal: str | None = None,
         dtmf_sender=None,
+        conference: str | None = None,
+        user_leg_sid: str | None = None,
     ) -> AgentSession:
         return AgentSession(
             call_id,
@@ -58,6 +61,8 @@ def create_app() -> FastAPI:
             goal=goal,
             dtmf_sender=dtmf_sender,
             tier2_executor=ThreadedExecutor(),
+            conference=conference,
+            user_leg_sid=user_leg_sid,
         )
 
     app.state.make_session = make_session

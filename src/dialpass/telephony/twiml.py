@@ -52,11 +52,15 @@ def play_digits_then_conference(digits: str, conference_name: str) -> str:
 
 
 def join_conference(conference_name: str, *, muted: bool, end_on_exit: bool = False) -> str:
-    """Leg B (the user's phone): join muted, stay connected passively."""
+    """Leg B (the user's phone): join the conference and stay connected passively
+    for the whole call. Joined muted at call start; the handoff unmutes this leg.
+    `startConferenceOnEnter=false` so the room doesn't start (and the hold-music
+    timer doesn't run) until Leg A — the outbound call — is actually in it."""
     return (
         '<?xml version="1.0" encoding="UTF-8"?>'
         "<Response>"
-        "<Say>This is DialPass. Connecting you now — please stay on the line.</Say>"
+        "<Say>This is DialPass. Stay on the line — I'll connect you as soon as "
+        "someone picks up.</Say>"
         "<Dial>"
         f'<Conference muted="{str(muted).lower()}" '
         f'startConferenceOnEnter="false" '

@@ -54,6 +54,8 @@ class AgentSession:
         goal: str | None = None,
         dtmf_sender: Callable[[str], None] | None = None,
         tier2_executor: Tier2Executor | None = None,
+        conference: str | None = None,
+        user_leg_sid: str | None = None,
     ) -> None:
         self.call_id = call_id
         self.settings = settings or get_settings()
@@ -61,6 +63,10 @@ class AgentSession:
         self.tier2 = tier2
         self.telemetry = telemetry or NullSink()
         self.goal = goal
+        # Conference room this call is in, and the user's (Leg B) call SID. Set
+        # on live calls; the handoff (M5 phase 3) unmutes user_leg_sid here.
+        self.conference = conference
+        self.user_leg_sid = user_leg_sid
         # Presses digits on the live call. Injected so agent/ stays vendor-free;
         # the media handler wires the Twilio-backed one. No-op offline.
         self.dtmf_sender: Callable[[str], None] = dtmf_sender or (lambda digits: None)

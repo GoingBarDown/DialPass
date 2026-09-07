@@ -10,7 +10,7 @@ from __future__ import annotations
 
 from fastapi import APIRouter, Query, Request, Response
 
-from ..telephony.twiml import join_conference, stream_and_conference
+from ..telephony.twiml import connect_stream, join_conference
 
 router = APIRouter()
 
@@ -22,10 +22,11 @@ def _media_ws_url(public_base_url: str) -> str:
 
 
 @router.api_route("/twiml/voice", methods=["GET", "POST"])
-def voice_twiml(request: Request, conference: str = Query(...)) -> Response:
+def voice_twiml(request: Request, group: str = Query(...)) -> Response:
+    """Leg A (the business call). Connect it to our media socket as a
+    bidirectional audio pipe — our server is the mixer from here on."""
     settings = request.app.state.settings
-    stream_url = _media_ws_url(settings.public_base_url)
-    xml = stream_and_conference(stream_url, conference)
+    xml = connect_stream(_media_ws_url(settings.public_base_url), group, "agent")
     return Response(content=xml, media_type="application/xml")
 
 
@@ -33,7 +34,8 @@ def voice_twiml(request: Request, conference: str = Query(...)) -> Response:
 def join_twiml(conference: str = Query(...)) -> Response:
     """Leg B (the user's phone). Twilio fetches this when the user answers the
     call DialPass placed to them; they join the conference muted and wait there
-    passively until the handoff unmutes them (M5 phase 3)."""
+    passively until the handoff unmutes them (M5 phase 3 switches this to a
+    stream + software relay)."""
     xml = join_conference(conference, muted=True)
     return Response(content=xml, media_type="application/xml")
 

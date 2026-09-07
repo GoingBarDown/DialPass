@@ -10,8 +10,6 @@ from dataclasses import dataclass
 
 from twilio.rest import Client
 
-from .twiml import play_digits_then_conference
-
 
 @dataclass(slots=True)
 class PlacedCall:
@@ -37,12 +35,7 @@ class TwilioClient:
         call = self._client.calls.create(to=user_number, from_=self._from_number, url=twiml_url)
         return PlacedCall(call_sid=call.sid, conference_name=conference_name)
 
-    def send_dtmf(self, call_sid: str, digits: str, conference_name: str) -> None:
-        """Press `digits` on the live call (Leg A). Twilio has no mid-call
-        send-digits API, so we redirect the call to TwiML that <Play>s the tones
-        and then rejoins the conference. The media stream survives the redirect."""
-        twiml = play_digits_then_conference(digits, conference_name)
-        self._client.calls(call_sid).update(twiml=twiml)
-
-    def set_participant_muted(self, conference: str, call_sid: str, *, muted: bool) -> None:
-        raise NotImplementedError("Conference control lands in M5")
+    def hang_up(self, call_sid: str) -> None:
+        """End a call leg. Recovery path (M8) — e.g. drop Leg A if the user's
+        gone and can't be re-reached."""
+        self._client.calls(call_sid).update(status="completed")

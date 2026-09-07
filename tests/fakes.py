@@ -12,8 +12,7 @@ class FakeTwilioClient:
     def __init__(self, *, ring_user_raises: Exception | None = None) -> None:
         self.outbound: list[dict] = []
         self.user_rings: list[dict] = []
-        self.dtmf: list[dict] = []
-        self.mutes: list[dict] = []
+        self.hangups: list[str] = []
         self._ring_user_raises = ring_user_raises
 
     def place_outbound_call(
@@ -32,10 +31,5 @@ class FakeTwilioClient:
         )
         return PlacedCall(call_sid="CAuser0001", conference_name=conference_name)
 
-    def send_dtmf(self, call_sid: str, digits: str, conference_name: str) -> None:
-        self.dtmf.append({"sid": call_sid, "digits": digits, "conference": conference_name})
-
-    def set_participant_muted(
-        self, conference: str, call_sid: str, *, muted: bool
-    ) -> None:
-        self.mutes.append({"conference": conference, "sid": call_sid, "muted": muted})
+    def hang_up(self, call_sid: str) -> None:
+        self.hangups.append(call_sid)

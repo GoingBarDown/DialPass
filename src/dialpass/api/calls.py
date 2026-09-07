@@ -51,21 +51,22 @@ def create_call(req: CallRequest, request: Request) -> CallAccepted:
             },
         )
 
-    conference_name = f"dialpass-{uuid.uuid4().hex[:12]}"
+    # `group` correlates this call's legs on our side (media.py keys everything by
+    # it — the leg SIDs aren't known until each leg connects).
+    group = f"dialpass-{uuid.uuid4().hex[:12]}"
     base = settings.public_base_url
-    voice_url = f"{base}/twiml/voice?conference={conference_name}"
-    placed = twilio_client.place_outbound_call(req.business_number, voice_url, conference_name)
+    voice_url = f"{base}/twiml/voice?group={group}"
+    placed = twilio_client.place_outbound_call(req.business_number, voice_url, group)
 
-    # media.py looks this up by Twilio's call SID when the media stream starts.
-    app.state.pending_goals[placed.call_sid] = req.goal
+    app.state.pending_goals[group] = req.goal
 
     # Leg B: ring the user now, join them muted. A failure here doesn't sink the
     # call — the agent can still navigate; the bridge just has no one to unmute
     # (M8 turns that into a fallback notification).
-    join_url = f"{base}/twiml/join?conference={conference_name}"
+    join_url = f"{base}/twiml/join?conference={group}"
     try:
-        user_leg = twilio_client.ring_user(req.user_number, join_url, conference_name)
-        app.state.user_legs[placed.call_sid] = user_leg.call_sid
+        user_leg = twilio_client.ring_user(req.user_number, join_url, group)
+        app.state.user_legs[group] = user_leg.call_sid
     except Exception:
         log.exception("call %s: failed to ring user leg %s", placed.call_sid, req.user_number)
 

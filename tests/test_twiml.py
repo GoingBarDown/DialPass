@@ -1,35 +1,23 @@
 from xml.etree import ElementTree as ET
 
-from dialpass.telephony.twiml import (
-    join_conference,
-    play_digits_then_conference,
-    stream_and_conference,
-)
+from dialpass.telephony.twiml import connect_stream, join_conference
 
 
-def test_stream_and_conference_is_valid_xml_with_stream_and_conference():
-    xml = stream_and_conference("wss://example.test/media", "room-abc")
+def test_connect_stream_is_a_bidirectional_pipe_with_group_and_role():
+    xml = connect_stream("wss://example.test/media", "dialpass-abc123", "agent")
     root = ET.fromstring(xml)
     assert root.tag == "Response"
-    assert root.find(".//Stream").attrib["url"] == "wss://example.test/media"
-    assert root.find(".//Conference").text == "room-abc"
-    # the media handler needs the conference name from the start event
-    param = root.find(".//Stream/Parameter")
-    assert param.attrib == {"name": "conference", "value": "room-abc"}
+    # <Connect> (bidirectional, terminal) — not <Start> (one-way fork)
+    assert root.find(".//Connect/Stream").attrib["url"] == "wss://example.test/media"
+    assert root.find(".//Start") is None
+    assert root.find(".//Conference") is None
+    params = {p.attrib["name"]: p.attrib["value"] for p in root.findall(".//Stream/Parameter")}
+    assert params == {"group": "dialpass-abc123", "role": "agent"}
 
 
-def test_play_digits_then_conference_plays_then_rejoins():
-    xml = play_digits_then_conference("2", "room-xyz")
-    root = ET.fromstring(xml)
-    assert root.find(".//Play").attrib["digits"].endswith("2w")
-    assert root.find(".//Conference").text == "room-xyz"
-
-
-def test_play_digits_strips_non_dtmf():
-    xml = play_digits_then_conference("2; DROP TABLE calls--1", "room")
-    digits = ET.fromstring(xml).find(".//Play").attrib["digits"]
-    assert set(digits) <= set("0123456789*#w")
-    assert "21" in digits
+def test_connect_stream_escapes_parameters():
+    xml = connect_stream("wss://x/media", 'g&"<', "user")
+    ET.fromstring(xml)  # would raise if the & / quotes weren't escaped
 
 
 def test_join_conference_muted_flag():

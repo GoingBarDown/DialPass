@@ -34,19 +34,22 @@ def test_calls_dials_both_legs_into_the_same_conference():
     assert len(fake.user_rings) == 1
     leg_a, leg_b = fake.outbound[0], fake.user_rings[0]
 
-    conf = leg_a["conference"]
-    assert leg_b["conference"] == conf  # same room
+    group = leg_a["conference"]  # the fake stores the group arg under this key
+    assert leg_b["conference"] == group  # both legs share the group id
+    assert group.startswith("dialpass-")
     assert leg_a["to"] == BODY["business_number"]
     assert leg_b["to"] == BODY["user_number"]
-    assert leg_a["url"] == f"https://dialpass.test/twiml/voice?conference={conf}"
-    assert leg_b["url"] == f"https://dialpass.test/twiml/join?conference={conf}"
+    assert leg_a["url"] == f"https://dialpass.test/twiml/voice?group={group}"
+    assert leg_b["url"] == f"https://dialpass.test/twiml/join?conference={group}"
 
 
 def test_calls_records_the_user_leg_for_the_handoff():
     app = _app_with_twilio()
     TestClient(app).post("/calls", json=BODY)
-    # keyed by the agent (Leg A) SID, so media.py can find it on stream start
-    assert app.state.user_legs == {"CAagent0001": "CAuser0001"}
+    # keyed by the group id, so either leg's media stream can find it on connect
+    assert list(app.state.user_legs.values()) == ["CAuser0001"]
+    (group,) = app.state.user_legs
+    assert group.startswith("dialpass-")
 
 
 def test_calls_survives_a_failed_user_ring():

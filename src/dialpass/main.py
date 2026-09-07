@@ -41,8 +41,9 @@ def create_app() -> FastAPI:
     app = FastAPI(title="DialPass", version="0.1.0")
     app.state.settings = settings
     app.state.sessions = {}
-    app.state.pending_goals = {}  # call_sid -> goal, set by /calls, consumed by /media
-    app.state.user_legs = {}  # agent call_sid -> user (Leg B) call_sid, for the handoff unmute
+    app.state.bridges = {}  # group_id -> CallBridge, for the lifetime of each call
+    app.state.pending_goals = {}  # group_id -> goal, set by /calls, consumed by /media
+    app.state.user_legs = {}  # group_id -> user (Leg B) call_sid, for the handoff
     app.state.twilio_client = _build_twilio_client(settings)
 
     def make_session(

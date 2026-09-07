@@ -5,48 +5,24 @@ Exercised for real in M2 (media stream) and M5 (conference bridge).
 
 from __future__ import annotations
 
-from xml.sax.saxutils import escape
+from xml.sax.saxutils import escape, quoteattr
 
 
-def stream_and_conference(stream_url: str, conference_name: str) -> str:
-    """Leg A (outbound to the business): fork audio to our media WebSocket, then
-    drop into the shared conference. The conference name rides along as a Stream
-    <Parameter> so the media handler gets it in the `start` event (it needs it to
-    redirect the call for DTMF in M4)."""
+def connect_stream(stream_url: str, group_id: str, role: str) -> str:
+    """A call leg as a bidirectional audio pipe to our media WebSocket (M5).
+
+    `<Connect><Stream>` consumes the leg — there is no conference and no verb
+    after it; our server is the mixer. `group` correlates a call's legs on our
+    side; `role` is `agent` (the business call) or `user` (Leg B)."""
     return (
         '<?xml version="1.0" encoding="UTF-8"?>'
         "<Response>"
-        "<Start>"
-        f'<Stream url="{escape(stream_url)}" track="inbound_track">'
-        f'<Parameter name="conference" value="{escape(conference_name)}"/>'
+        "<Connect>"
+        f"<Stream url={quoteattr(stream_url)}>"
+        f"<Parameter name=\"group\" value={quoteattr(group_id)}/>"
+        f"<Parameter name=\"role\" value={quoteattr(role)}/>"
         "</Stream>"
-        "</Start>"
-        "<Dial>"
-        f'<Conference startConferenceOnEnter="true" endConferenceOnExit="true">'
-        f"{escape(conference_name)}</Conference>"
-        "</Dial>"
-        "</Response>"
-    )
-
-
-def play_digits_then_conference(digits: str, conference_name: str) -> str:
-    """M4 DTMF injection. Redirect target for `calls(sid).update()`: play the
-    touch-tones toward the far end, then drop back into the conference.
-
-    The `w`s are Twilio's 0.5s pauses — a lead-in so the first tone isn't clipped
-    by the redirect, and a tail so tones aren't rushed. The `<Start><Stream>`
-    from the original TwiML survives this redirect (verified), so it isn't
-    re-added here.
-    """
-    safe_digits = "".join(c for c in digits if c in "0123456789*#w")
-    return (
-        '<?xml version="1.0" encoding="UTF-8"?>'
-        "<Response>"
-        f'<Play digits="ww{escape(safe_digits)}w"/>'
-        "<Dial>"
-        f'<Conference startConferenceOnEnter="true" endConferenceOnExit="true">'
-        f"{escape(conference_name)}</Conference>"
-        "</Dial>"
+        "</Connect>"
         "</Response>"
     )
 

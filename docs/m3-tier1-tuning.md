@@ -109,7 +109,7 @@ Old speech/music rule:
 
 ```python
 if flatness < 0.15:
-    return HOLD_MUSIC          # "tonal + sustained -> music"
+    return HOLD_MUSIC  # "tonal + sustained -> music"
 if zcr > 0.08 and flatness > 0.2:
     return LIVE_SPEECH_CANDIDATE
 ```

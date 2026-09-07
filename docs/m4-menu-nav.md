@@ -17,7 +17,9 @@ Twilio has **no mid-call send-digits API** — `sendDigits` only fires at call
 setup. The plan was to press a key by *redirecting* the live call:
 
 ```python
-client.calls(sid).update(twiml='<Response><Play digits="ww2w"/><Dial><Conference>NAME</Conference></Dial></Response>')
+client.calls(sid).update(
+    twiml='<Response><Play digits="ww2w"/><Dial><Conference>NAME</Conference></Dial></Response>'
+)
 ```
 
 **The risk:** does the `<Start><Stream>` media fork (how Tier 1 hears the call)

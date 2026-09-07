@@ -76,13 +76,25 @@ async def test_ivr_branch_twiml(request: Request) -> Response:
     form = await request.form()
     digit = str(form.get("Digits", ""))
     if digit in ("0", "2"):
+        # Hold music long enough to reach ON_HOLD, then an "agent" who keeps
+        # talking for ~20s so the probe catches him mid-sentence and the relay
+        # opens while he's still on the line (a one-line greeting then silence
+        # classifies as NOT HUMAN — the probe hears nothing back).
+        v = 'voice="Polly.Matthew"'
         body = (
             "<Say>Please hold while we connect you to the next available agent.</Say>"
-            f'<Play loop="2">{_MUSIC}</Play>'
-            '<Say voice="Polly.Matthew">Hi there, thanks for holding. This is Mark '
-            "on the support desk. Who am I speaking with, and how can I help today?</Say>"
-            '<Pause length="10"/>'
-            "<Say>Hello? I can't hear anyone. I'll try back later. Goodbye.</Say>"
+            f'<Play loop="1">{_MUSIC}</Play>'
+            f"<Say {v}>Hi there, thanks for holding. This is Mark on the support desk.</Say>"
+            '<Pause length="1"/>'
+            f"<Say {v}>Can you hear me okay? Who am I speaking with today?</Say>"
+            '<Pause length="2"/>'
+            f"<Say {v}>Hello? This is Mark, I'm still here. How can I help you?</Say>"
+            '<Pause length="2"/>'
+            f"<Say {v}>Take your time — I'll stay on the line with you.</Say>"
+            '<Pause length="3"/>'
+            f"<Say {v}>Okay, still holding for you here. Let me know when you're ready.</Say>"
+            '<Pause length="8"/>'
+            "<Say>I can't hear anyone. I'll try back later. Goodbye.</Say>"
         )
     else:
         body = (

@@ -7,6 +7,10 @@ dispatches the FSM's actions to Tier 2 / telephony / telemetry.
 M1 stubs the outward effects: WAKE_TIER2_* and BRIDGE emit telemetry and call the
 fake Tier 2, but no DTMF is injected and no conference is manipulated. M4/M5 wire
 those to `telephony/`.
+
+Tier 2 calls (menu decision, probe) block for 1-2s, so they don't run on the
+media loop — `_tier2_exec` runs them off to the side and `_poll_tier2` applies
+the result on a later tick. See `agent/executor.py`.
 """
 
 from __future__ import annotations
@@ -31,6 +35,7 @@ from ..telemetry.events import (
 from ..telemetry.publisher import NullSink, TelemetrySink
 from .buffer import RollingBuffer
 from .classifier import Classifier, Frame
+from .executor import InlineExecutor, Tier2Executor
 from .state import Action, CallState, CallStateMachine, FsmConfig
 
 log = logging.getLogger("dialpass.agent")
@@ -48,6 +53,9 @@ class AgentSession:
         fsm_config: FsmConfig | None = None,
         goal: str | None = None,
         dtmf_sender: Callable[[str], None] | None = None,
+        tier2_executor: Tier2Executor | None = None,
+        conference: str | None = None,
+        user_leg_sid: str | None = None,
     ) -> None:
         self.call_id = call_id
         self.settings = settings or get_settings()
@@ -55,9 +63,23 @@ class AgentSession:
         self.tier2 = tier2
         self.telemetry = telemetry or NullSink()
         self.goal = goal
+        # Conference room this call is in, and the user's (Leg B) call SID. Set
+        # on live calls; the handoff (M5 phase 3) unmutes user_leg_sid here.
+        self.conference = conference
+        self.user_leg_sid = user_leg_sid
         # Presses digits on the live call. Injected so agent/ stays vendor-free;
         # the media handler wires the Twilio-backed one. No-op offline.
         self.dtmf_sender: Callable[[str], None] = dtmf_sender or (lambda digits: None)
+        # Starts the handoff: speak a holding line into the business call, notify
+        # the user, open the Leg A <-> Leg B audio relay. Injected by the bridge
+        # so agent/ stays vendor-free; no-op offline.
+        self.on_bridge: Callable[[], None] = lambda: None
+        # Runs the blocking Tier 2 calls. InlineExecutor (default) keeps the sim
+        # and tests deterministic; the live handler passes a ThreadedExecutor.
+        self._tier2_exec: Tier2Executor = tier2_executor or InlineExecutor()
+        # "menu" | "probe" while a Tier 2 call is outstanding, else None. Blocks
+        # a second wake until the first result lands.
+        self._tier2_kind: str | None = None
 
         self.fsm = CallStateMachine(fsm_config)
         self.buffer = RollingBuffer(self.settings.buffer_seconds, self.settings.sample_rate)
@@ -127,11 +149,14 @@ class AgentSession:
         self._dispatch(action, now)
 
         # fire a deferred menu wake once its collect window has elapsed (and
-        # we're still in a menu — a hold/hangup in the meantime cancels it)
+        # we're still in a menu, and no other Tier 2 call is in flight — a
+        # hold/hangup or a still-running decision in the meantime cancels it)
         if self._menu_wake_due is not None and now >= self._menu_wake_due:
             self._menu_wake_due = None
-            if self.fsm.state == CallState.IVR_MENU:
-                self._handle_menu(now)
+            if self.fsm.state == CallState.IVR_MENU and self._tier2_kind is None:
+                self._start_menu(now)
+
+        self._poll_tier2(now)
 
     # -- FSM action dispatch -------------------------------------------
     def _dispatch(self, action: Action, now: float) -> None:
@@ -140,39 +165,63 @@ class AgentSession:
         if action == Action.WAKE_TIER2_MENU:
             self._menu_wake_due = now + self.settings.menu_collect_s
         elif action == Action.WAKE_TIER2_PROBE:
-            self._handle_probe(now)
+            if self._tier2_kind is None:
+                self._start_probe(now)
         elif action == Action.BRIDGE:
             self._bridge(now)
         elif action == Action.FAIL:
             self._fail(now, reason="non_connect")
 
-    def _handle_menu(self, now: float) -> None:
+    # -- Tier 2: start off the media loop, apply the result on a later tick --
+    def _start_menu(self, now: float) -> None:
         self.telemetry.emit(Tier2Woken(call_id=self.call_id, t=now, reason="menu"))
-        try:
-            decision = self.tier2.choose_menu_digit(
-                self.buffer.snapshot(), self.settings.sample_rate, self.goal
-            )
-        except NotImplementedError:
-            # Real Tier 2 (M4) isn't wired yet — don't crash a live call over it.
-            self._fail(now, reason="tier2_not_implemented")
-            return
-        if decision.digits:
-            try:
-                self.dtmf_sender(decision.digits)
-            except Exception:
-                # A failed keypress shouldn't kill the call — Tier 1 keeps
-                # listening, and the menu will re-prompt on no input.
-                log.exception("call %s: DTMF send failed", self.call_id)
-            self.telemetry.emit(DtmfSent(call_id=self.call_id, t=now, digits=decision.digits))
-            self.fsm.note_menu_action(now)  # re-arm the wake for a submenu
+        self._tier2_kind = "menu"
+        snap = self.buffer.snapshot()
+        sr, goal = self.settings.sample_rate, self.goal
+        self._tier2_exec.submit(lambda: self.tier2.choose_menu_digit(snap, sr, goal))
 
-    def _handle_probe(self, now: float) -> None:
+    def _start_probe(self, now: float) -> None:
         self.telemetry.emit(Tier2Woken(call_id=self.call_id, t=now, reason="probe"))
-        try:
-            outcome = self.tier2.probe(self.buffer.snapshot(), self.settings.sample_rate)
-        except NotImplementedError:
-            self._fail(now, reason="tier2_not_implemented")
+        self._tier2_kind = "probe"
+        snap = self.buffer.snapshot()
+        sr = self.settings.sample_rate
+        self._tier2_exec.submit(lambda: self.tier2.probe(snap, sr))
+
+    def _poll_tier2(self, now: float) -> None:
+        if self._tier2_kind is None:
             return
+        result = self._tier2_exec.poll()
+        if result is None:
+            return
+        value, error = result
+        kind, self._tier2_kind = self._tier2_kind, None
+        if error is not None:
+            if isinstance(error, NotImplementedError):
+                # A stubbed Tier 2 (probe lands in M5) — don't crash a live call.
+                self._fail(now, reason="tier2_not_implemented")
+            else:
+                log.error("call %s: tier2 %s failed", self.call_id, kind, exc_info=error)
+                if kind == "probe":
+                    self._fail(now, reason="tier2_error")
+            return
+        if kind == "menu":
+            self._apply_menu(value, now)
+        elif kind == "probe":
+            self._apply_probe(value, now)
+
+    def _apply_menu(self, decision, now: float) -> None:
+        if not decision.digits:
+            return
+        try:
+            self.dtmf_sender(decision.digits)
+        except Exception:
+            # A failed keypress shouldn't kill the call — Tier 1 keeps listening,
+            # and the menu will re-prompt on no input.
+            log.exception("call %s: DTMF send failed", self.call_id)
+        self.telemetry.emit(DtmfSent(call_id=self.call_id, t=now, digits=decision.digits))
+        self.fsm.note_menu_action(now)  # re-arm the wake for a submenu
+
+    def _apply_probe(self, outcome, now: float) -> None:
         self.telemetry.emit(ProbeResult(call_id=self.call_id, t=now, is_human=outcome.is_human))
         before = self.fsm.state
         follow_up = self.fsm.probe_result(outcome.is_human, now)
@@ -182,16 +231,18 @@ class AgentSession:
     def _bridge(self, now: float) -> None:
         self.telemetry.emit(HumanDetected(call_id=self.call_id, t=now))
         try:
-            self.tier2.say_to_agent("Thanks for picking up — connecting my client now, one moment.")
-        except NotImplementedError:
-            self._fail(now, reason="tier2_not_implemented")
+            # Speak the holding line, text the user, open the audio relay. The
+            # bridge does this asynchronously; this call just kicks it off.
+            self.on_bridge()
+        except Exception:
+            log.exception("call %s: handoff failed to start", self.call_id)
+            self._fail(now, reason="handoff_error")
             return
         before = self.fsm.state
         self.fsm.bridged()
         self._emit_state_change(before, now)
         self.telemetry.emit(BridgeStarted(call_id=self.call_id, t=now))
-        # M5: notify the user, wait a beat, stop forwarding AI audio, unmute the
-        # user's conference leg.
+        # The relay carries the two parties from here; this session's job is done.
         before = self.fsm.state
         self.fsm.completed()
         self._emit_state_change(before, now)
@@ -201,6 +252,11 @@ class AgentSession:
     def _fail(self, now: float, reason: str) -> None:
         self.telemetry.emit(CallFailed(call_id=self.call_id, t=now, reason=reason))
         self.finished = True
+
+    def close(self) -> None:
+        """Release the Tier 2 executor's thread. Called when the media stream
+        ends. Idempotent."""
+        self._tier2_exec.close()
 
     def _emit_state_change(self, before: CallState, now: float) -> None:
         if self.fsm.state != before:

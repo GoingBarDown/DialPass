@@ -48,11 +48,16 @@ def _menu_instructions(goal: str | None) -> str:
         "agent / representative / operator option when nothing matches better.\n"
         "Language prompts: choose the English option. If English is the default "
         '(e.g. "for French press 2" with no key for English), use "".\n'
-        'Also use "" if no stated option fits, or none were given (it asks you '
-        "to speak, or it is hold music / an after-hours message).\n"
+        "Data entry: if the line asks you to ENTER a number (account number, "
+        "member ID, meeting ID, zip, extension) and that exact number appears in "
+        'the goal, return those digits — add "#" only if it says "followed by '
+        'pound". Never invent digits that are not in the goal.\n'
+        'Otherwise use "": no stated option fits, none were given, it asks you '
+        "to speak, or it is hold music / an after-hours message.\n"
         "Output EXACTLY ONE LINE of JSON and NOTHING else — no prose, no code "
         "fences, never ask a question:\n"
-        '{"digit": "<0-9, * or #, or empty>", "rationale": "<=12 words>"}'
+        '{"digit": "<one key 0-9 * #, or the digits to enter, or empty>", '
+        '"rationale": "<=12 words>"}'
     )
 
 
@@ -76,10 +81,12 @@ class RealtimeClient:
         if text is None:
             return MenuDecision(None, rationale="tier2 unavailable (timeout or error)")
         log.debug("menu model reply: %s", text.replace("\n", " ")[:300])
-        digit, rationale = _parse_verdict(text)
-        if digit and digit not in _VALID_DIGITS:
-            return MenuDecision(None, rationale=f"model returned non-DTMF digit {digit!r}")
-        return MenuDecision(digit or None, rationale=rationale or "")
+        digits, rationale = _parse_verdict(text)
+        if digits and not set(digits) <= _VALID_DIGITS:
+            return MenuDecision(None, rationale=f"model returned non-DTMF keys {digits!r}")
+        if len(digits) > 20:  # a menu key or a short ID, never a monologue
+            return MenuDecision(None, rationale="model returned too many keys")
+        return MenuDecision(digits or None, rationale=rationale or "")
 
     def probe(self, audio: np.ndarray, sample_rate: int) -> ProbeOutcome:
         raise NotImplementedError("Tier 2 probe lands in M5")

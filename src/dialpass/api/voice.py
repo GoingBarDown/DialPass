@@ -10,7 +10,7 @@ from __future__ import annotations
 
 from fastapi import APIRouter, Query, Request, Response
 
-from ..telephony.twiml import stream_and_conference
+from ..telephony.twiml import connect_stream
 
 router = APIRouter()
 
@@ -22,10 +22,76 @@ def _media_ws_url(public_base_url: str) -> str:
 
 
 @router.api_route("/twiml/voice", methods=["GET", "POST"])
-def voice_twiml(request: Request, conference: str = Query(...)) -> Response:
+def voice_twiml(request: Request, group: str = Query(...)) -> Response:
+    """Leg A (the business call). Connect it to our media socket as a
+    bidirectional audio pipe — our server is the mixer from here on."""
     settings = request.app.state.settings
-    stream_url = _media_ws_url(settings.public_base_url)
-    xml = stream_and_conference(stream_url, conference)
+    xml = connect_stream(_media_ws_url(settings.public_base_url), group, "agent")
+    return Response(content=xml, media_type="application/xml")
+
+
+@router.api_route("/twiml/join", methods=["GET", "POST"])
+def join_twiml(request: Request, group: str = Query(...)) -> Response:
+    """Leg B (the user's phone). Twilio fetches this when the user answers the
+    call DialPass placed to them; they connect to our media socket (role=user)
+    and wait — hearing only the intro line — until the handoff opens the relay
+    between them and the business call."""
+    settings = request.app.state.settings
+    xml = connect_stream(
+        _media_ws_url(settings.public_base_url),
+        group,
+        "user",
+        intro=(
+            "This is DialPass. Stay on the line — I'll connect you the moment "
+            "someone picks up."
+        ),
+    )
+    return Response(content=xml, media_type="application/xml")
+
+
+_MUSIC = "http://demo.twilio.com/docs/classic.mp3"
+
+
+@router.api_route("/twiml/test-ivr", methods=["GET", "POST"])
+def test_ivr_twiml(request: Request) -> Response:
+    """Dev only: a reproducible phone tree to point a Twilio number at, so
+    DialPass has something with a real DTMF menu + a scripted agent pickup to
+    navigate end to end. Not a production path."""
+    base = request.app.state.settings.public_base_url
+    xml = (
+        '<?xml version="1.0" encoding="UTF-8"?>'
+        "<Response>"
+        f'<Gather input="dtmf" numDigits="1" timeout="12" action="{base}/twiml/test-ivr-branch">'
+        "<Say>Thank you for calling Acme Corporation. "
+        "For billing, press 1. For technical support, press 2. "
+        "To speak with an agent, press 0.</Say>"
+        "</Gather>"
+        "<Say>We did not receive a selection. Goodbye.</Say>"
+        "</Response>"
+    )
+    return Response(content=xml, media_type="application/xml")
+
+
+@router.api_route("/twiml/test-ivr-branch", methods=["GET", "POST"])
+async def test_ivr_branch_twiml(request: Request) -> Response:
+    form = await request.form()
+    digit = str(form.get("Digits", ""))
+    if digit in ("0", "2"):
+        body = (
+            "<Say>Please hold while we connect you to the next available agent.</Say>"
+            f'<Play loop="2">{_MUSIC}</Play>'
+            '<Say voice="Polly.Matthew">Hi there, thanks for holding. This is Mark '
+            "on the support desk. Who am I speaking with, and how can I help today?</Say>"
+            '<Pause length="10"/>'
+            "<Say>Hello? I can't hear anyone. I'll try back later. Goodbye.</Say>"
+        )
+    else:
+        body = (
+            "<Say>You selected billing. All of our representatives are currently busy. "
+            "Please continue to hold.</Say>"
+            f'<Play loop="10">{_MUSIC}</Play>'
+        )
+    xml = f'<?xml version="1.0" encoding="UTF-8"?><Response>{body}</Response>'
     return Response(content=xml, media_type="application/xml")
 
 

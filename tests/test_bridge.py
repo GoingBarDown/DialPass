@@ -6,6 +6,7 @@ import base64
 import time
 
 import numpy as np
+import pytest
 
 from dialpass.agent.bridge import CallBridge
 from dialpass.agent.classifier import ScriptedClassifier
@@ -160,11 +161,35 @@ def test_begin_handoff_opens_a_two_way_relay_and_notifies_the_user():
 def test_begin_handoff_is_idempotent():
     bridge = CallBridge("grp", _session())
     bridge.bind_agent("MZa")
+    bridge.bind_user("MZb")
     texts: list[str] = []
     bridge.notify_user = texts.append
     bridge.begin_handoff()
     bridge.begin_handoff()
     assert len(texts) == 1
+
+
+def test_begin_handoff_without_a_user_leg_raises_for_the_fallback():
+    from dialpass.agent.session import HandoffUnavailable
+
+    bridge = CallBridge("grp", _session())
+    bridge.bind_agent("MZa")  # user never connected / hung up
+    with pytest.raises(HandoffUnavailable) as exc:
+        bridge.begin_handoff()
+    assert exc.value.reason == "user_left"
+    assert bridge.relay_open is False
+
+
+def test_session_fail_routes_to_on_teardown_with_the_reason():
+    session = _session()
+    bridge = CallBridge("grp", session)
+    reasons: list[str | None] = []
+    bridge.on_teardown = reasons.append
+
+    session.abort("non_connect")
+
+    assert reasons == ["non_connect"]
+    assert session.finished is True
 
 
 def test_session_bridge_hook_is_wired_to_begin_handoff():

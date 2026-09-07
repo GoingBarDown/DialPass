@@ -9,12 +9,15 @@ transport has no non-blocking receive.
 from __future__ import annotations
 
 import base64
+import time
 
 from fastapi.testclient import TestClient
 from tests.fakes import FakeTwilioClient
 
+from dialpass.agent.bridge import CallBridge
 from dialpass.agent.classifier import ScriptedClassifier
 from dialpass.agent.session import AgentSession
+from dialpass.api.media import _MAX_REDIALS, reap_stale_bridges
 from dialpass.config import get_settings
 from dialpass.main import create_app
 from dialpass.realtime.fake import FakeTier2
@@ -101,7 +104,9 @@ def test_media_socket_hands_off_to_the_user_when_a_human_is_detected():
         for i in range(0, len(ulaw), 160):
             ws.send_json(_frame(ulaw[i : i + 160]))
             if not captured and GROUP in app.state.bridges:
-                captured.append(app.state.bridges[GROUP])
+                bridge = app.state.bridges[GROUP]
+                bridge.bind_user("MZuser")  # user leg is on the line for the handoff
+                captured.append(bridge)
         ws.send_json({"event": "stop"})
 
     kinds = [e.payload()["kind"] for e in sink.events]
@@ -113,8 +118,6 @@ def test_media_socket_hands_off_to_the_user_when_a_human_is_detected():
 
 
 def test_media_socket_attaches_a_user_leg_to_the_existing_bridge():
-    from dialpass.agent.bridge import CallBridge
-
     app, _ = _app_with_capturing_session()
     session = app.state.make_session("CAtest")
     bridge = CallBridge(GROUP, session)
@@ -131,4 +134,92 @@ def test_media_socket_attaches_a_user_leg_to_the_existing_bridge():
     # the user's voice was relayed toward the agent leg
     relayed = bridge.drain_agent()
     assert relayed and all(m["streamSid"] == "MZagent" for m in relayed)
+    session.close()
+
+
+# ---- M8: drop recovery -------------------------------------------------
+def _drop_agent_leg_mid_call(app):
+    """Connect the agent leg, feed a little audio, then vanish (no `stop`)."""
+    pcm, _ = synthesize_call()
+    ulaw = pcm16_to_ulaw(pcm)
+    with TestClient(app).websocket_connect("/media") as ws:
+        ws.send_json(_start())
+        for i in range(0, 160 * 6, 160):  # a few ringback frames — call not finished
+            ws.send_json(_frame(ulaw[i : i + 160]))
+
+
+def test_agent_leg_drop_redials_and_keeps_the_call_context():
+    app, _ = _app_with_capturing_session()
+    app.state.call_meta[GROUP] = {"business_number": "+18005550100", "redials": 0}
+
+    _drop_agent_leg_mid_call(app)
+
+    fake = app.state.twilio_client
+    assert [c["to"] for c in fake.outbound] == ["+18005550100"]  # re-dialed once
+    assert app.state.call_meta[GROUP]["redials"] == 1
+    assert GROUP in app.state.pending_goals  # context kept for the fresh leg
+    assert GROUP not in app.state.bridges  # old bridge dropped
+
+
+def test_agent_leg_drop_gives_up_after_max_redials():
+    app, _ = _app_with_capturing_session()
+    app.state.user_numbers[GROUP] = "+15145550123"
+    app.state.user_legs[GROUP] = "CAuser0001"
+    app.state.call_meta[GROUP] = {"business_number": "+18005550100", "redials": _MAX_REDIALS}
+
+    _drop_agent_leg_mid_call(app)
+
+    fake = app.state.twilio_client
+    assert fake.outbound == []  # no more redials
+    assert [s["to"] for s in fake.sms] == ["+15145550123"]  # fallback text sent
+    assert "CAuser0001" in fake.hangups  # user leg hung up
+    assert GROUP not in app.state.pending_goals  # context cleared
+    assert GROUP not in app.state.call_meta
+
+
+def test_clean_stop_does_not_redial():
+    app, _ = _app_with_capturing_session()
+    app.state.call_meta[GROUP] = {"business_number": "+18005550100", "redials": 0}
+    pcm, _ = synthesize_call()
+    ulaw = pcm16_to_ulaw(pcm)
+
+    with TestClient(app).websocket_connect("/media") as ws:
+        ws.send_json(_start())
+        for i in range(0, 160 * 6, 160):
+            ws.send_json(_frame(ulaw[i : i + 160]))
+        ws.send_json({"event": "stop"})
+
+    assert app.state.twilio_client.outbound == []
+    assert GROUP not in app.state.call_meta
+
+
+def test_reap_stale_bridges_clears_a_stuck_reconnect():
+    app, _ = _app_with_capturing_session()
+    app.state.user_numbers[GROUP] = "+15145550123"
+    session = app.state.make_session("CAagent", user_leg_sid="CAuser")
+    bridge = CallBridge(GROUP, session)
+    bridge.reconnecting = True
+    bridge.reconnect_since = time.monotonic() - 999
+    app.state.bridges[GROUP] = bridge
+    app.state.sessions["CAagent"] = session
+
+    reaped = reap_stale_bridges(app)
+
+    assert reaped == 1
+    assert GROUP not in app.state.bridges
+    fake = app.state.twilio_client
+    assert "CAagent" in fake.hangups and "CAuser" in fake.hangups
+    assert [s["to"] for s in fake.sms] == ["+15145550123"]
+
+
+def test_reap_leaves_a_healthy_reconnect_alone():
+    app, _ = _app_with_capturing_session()
+    session = app.state.make_session("CAagent")
+    bridge = CallBridge(GROUP, session)
+    bridge.reconnecting = True
+    bridge.reconnect_since = time.monotonic()  # just started — still within grace
+    app.state.bridges[GROUP] = bridge
+
+    assert reap_stale_bridges(app) == 0
+    assert GROUP in app.state.bridges
     session.close()

@@ -29,7 +29,7 @@ import numpy as np
 from websockets.asyncio.client import connect
 
 from ..telephony.audio import ulaw_to_pcm16
-from .protocol import MenuDecision, ProbeOutcome, Tier2
+from .protocol import MenuDecision, ProbeOutcome, Tier2, Tier2Unavailable
 
 log = logging.getLogger("dialpass.realtime")
 
@@ -143,6 +143,7 @@ async def probe_exchange(
                     )
 
                 feeder = asyncio.create_task(feed())
+                errored = False
                 try:
                     async for raw in ws:
                         evt = json.loads(raw)
@@ -156,15 +157,18 @@ async def probe_exchange(
                             text.append(evt.get("delta", ""))
                         elif et == "error":
                             log.warning("probe error event: %s", evt.get("error"))
+                            errored = True
                             break
                         if _VERDICT.search("".join(text)):
                             break
                 finally:
                     feeder.cancel()
+                if errored and not _VERDICT.search("".join(text)):
+                    return ProbeOutcome(is_human=False, ok=False, transcript="probe error")
                 return verdict_from_text("".join(text))
     except (TimeoutError, OSError, ConnectionError) as exc:
         log.warning("probe exchange failed: %s", exc)
-        return ProbeOutcome(is_human=False, transcript="probe unavailable")
+        return ProbeOutcome(is_human=False, ok=False, transcript="probe unavailable")
 
 
 _SPEAK_SYSTEM = (
@@ -246,8 +250,14 @@ class StreamingProbe:
 
     def probe(self, audio, sample_rate) -> ProbeOutcome:
         # Called on the Tier 2 worker thread; the exchange runs on the media loop.
-        # `probe_exchange` has its own 15s cap — this is just a backstop.
-        return self._run_probe().result(timeout=25)
+        # `probe_exchange` has its own 15s cap — the 25s here is just a backstop.
+        try:
+            outcome = self._run_probe().result(timeout=25)
+        except Exception as exc:
+            raise Tier2Unavailable(f"probe exchange raised: {exc}") from exc
+        if not outcome.ok:
+            raise Tier2Unavailable(outcome.transcript or "probe exchange failed")
+        return outcome
 
     def say_to_agent(self, text: str) -> None:
         self._inner.say_to_agent(text)

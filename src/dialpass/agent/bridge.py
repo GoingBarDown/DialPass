@@ -26,6 +26,7 @@ import asyncio
 import base64
 import logging
 import threading
+import time
 from collections.abc import Callable
 from concurrent.futures import Future
 
@@ -35,7 +36,7 @@ from ..realtime.protocol import ProbeOutcome
 from ..realtime.stream import probe_exchange, speak_exchange
 from ..telephony.audio import pcm16_to_ulaw, ulaw_to_pcm16
 from ..telephony.recorder import WavRecorder
-from .session import AgentSession
+from .session import AgentSession, HandoffUnavailable
 
 log = logging.getLogger("dialpass.bridge")
 
@@ -66,8 +67,14 @@ class CallBridge:
         # tear the call down.
         self.dtmf_redirect: Callable[[str], None] = lambda digits: None
         self.reconnecting = False
+        # monotonic time the current DTMF redirect started, so a sweeper can reap
+        # a bridge whose stream never came back (M8).
+        self.reconnect_since: float | None = None
         # Texts the user (media.py wires the Twilio-backed one). No-op offline.
         self.notify_user: Callable[[str], None] = lambda body: None
+        # Ends the call for good — fallback SMS + hang up both legs + drop the
+        # bridge. media.py wires this; no-op offline. `reason` picks the SMS.
+        self.on_teardown: Callable[[str | None], None] = lambda reason: None
         # False until the handoff: Leg A <-> Leg B audio is not relayed, Leg B
         # hears only silence (its <Say> intro told it to wait).
         self.relay_open = False
@@ -75,9 +82,10 @@ class CallBridge:
         # Dev-only WAV tee; survives DTMF reconnects (media.py owns the object).
         self.recorder: WavRecorder | None = None
         self._closed = False
-        # Wire the session's keypress and handoff hooks to us.
+        # Wire the session's keypress, handoff and failure hooks to us.
         session.dtmf_sender = self.press_dtmf
         session.on_bridge = self.begin_handoff
+        session.on_fail = self.on_session_fail
 
     # -- leg binding -------------------------------------------------------
     def bind_agent(self, stream_sid: str, loop: asyncio.AbstractEventLoop | None = None) -> None:
@@ -118,6 +126,7 @@ class CallBridge:
             return
         log.info("bridge %s: pressing %s (redirect + reconnect)", self.group_id, safe)
         self.reconnecting = True
+        self.reconnect_since = time.monotonic()
         # The Twilio REST call blocks ~100-300ms — keep it off the media loop.
         threading.Thread(target=self.dtmf_redirect, args=(safe,), daemon=True).start()
 
@@ -174,11 +183,14 @@ class CallBridge:
             return
         self._handoff_started = True
         settings = self.session.settings
+        if self.user_stream_sid is None:
+            # The user hung up before we found a human — nobody to hand off to.
+            raise HandoffUnavailable("user_left")
         if self._loop is None or not settings.openai_api_key:
             # Nothing async to do — no holding line to synthesize (offline / no
             # key) or no loop to run it on (unit tests). Open the relay now.
             self.relay_open = True
-            self._safe_notify()
+            self._safe_notify(_USER_SMS)
             return
         self._loop.create_task(self._do_handoff())
 
@@ -198,12 +210,20 @@ class CallBridge:
                 break
             await asyncio.sleep(0.02)
         self.relay_open = True
-        self._safe_notify()
+        self._safe_notify(_USER_SMS)
         log.info("bridge %s: relay open — user and agent connected", self.group_id)
 
-    def _safe_notify(self) -> None:
+    # -- failure -------------------------------------------------------
+    def on_session_fail(self, reason: str) -> None:
+        """`AgentSession.on_fail`: the call couldn't finish. Hand off to
+        `on_teardown`, which texts the user a reason-appropriate line and hangs
+        up both legs instead of leaving them on a dead line."""
+        log.info("bridge %s: call failed (%s)", self.group_id, reason)
+        self.on_teardown(reason)
+
+    def _safe_notify(self, body: str) -> None:
         try:
-            self.notify_user(_USER_SMS)
+            self.notify_user(body)
         except Exception:
             log.exception("bridge %s: user notification failed", self.group_id)
 

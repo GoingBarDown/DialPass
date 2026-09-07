@@ -15,6 +15,11 @@ A keypress redirects the agent leg away and back (see CallBridge.press_dtmf), so
 second `start` for a `group` that already has a bridge is a **reconnect** — reuse
 the session, just re-bind the new stream.
 
+M8: an agent leg that drops mid-call (no `stop`, call not finished) is re-dialed
+up to `_MAX_REDIALS` times; past that — or on any hard failure — the user gets a
+fallback SMS and both legs are hung up. `reap_stale_bridges` (run from the app
+lifespan) clears bridges whose DTMF reconnect never arrived.
+
 If `DIALPASS_RECORD_DIR` is set, Leg A's decoded audio is also written to a WAV
 for offline classifier tuning (M3 dev aid).
 """
@@ -26,11 +31,13 @@ import base64
 import contextlib
 import json
 import logging
+import time
 
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
 
 from ..agent.bridge import CallBridge
 from ..realtime.stream import StreamingProbe
+from ..resilience.fallback import fallback_message
 from ..telephony.audio import ulaw_to_pcm16
 from ..telephony.recorder import WavRecorder
 
@@ -43,7 +50,72 @@ log = logging.getLogger("dialpass.media")
 _USER_ATTACH_TRIES = 100
 _USER_ATTACH_INTERVAL = 0.05
 
+_MAX_REDIALS = 2  # per call, on an unexpected agent-leg drop
+_RECONNECT_GRACE_S = 20.0  # a DTMF reconnect that hasn't landed by now is dead
 
+
+# ---- Twilio side effects (all at call end / failure, never mid-audio) ----
+def _hang_up(app, call_sid: str | None) -> None:
+    tw = app.state.twilio_client
+    if tw is None or not call_sid or call_sid == "unknown":
+        return
+    try:
+        tw.hang_up(call_sid)
+    except Exception:
+        log.exception("media: hang up %s failed", call_sid)
+
+
+def _sms(app, group: str, body: str) -> None:
+    tw = app.state.twilio_client
+    number = app.state.user_numbers.get(group)
+    if tw is None or not number:
+        return
+    try:
+        tw.send_sms(number, body)
+    except Exception:
+        log.exception("media: SMS to %s failed", group)
+
+
+def _clear_context(app, group: str) -> None:
+    for d in (
+        app.state.pending_goals,
+        app.state.user_legs,
+        app.state.user_numbers,
+        app.state.call_meta,
+    ):
+        d.pop(group, None)
+
+
+def _teardown_group(app, group: str, *, reason: str | None = None, hang_up: bool = False) -> None:
+    """End a call for good: drop the bridge, optionally text the user a fallback
+    line and hang up both legs, then clear the per-group context. Idempotent."""
+    bridge = app.state.bridges.pop(group, None)
+    if bridge is not None:
+        app.state.sessions.pop(bridge.session.call_id, None)
+        if reason is not None:
+            _sms(app, group, fallback_message(reason))
+        if hang_up:
+            _hang_up(app, bridge.session.call_id)
+            _hang_up(app, bridge.session.user_leg_sid)
+        bridge.close()
+    _clear_context(app, group)
+
+
+def reap_stale_bridges(app, *, now: float | None = None) -> int:
+    """Clear any bridge stuck mid-reconnect past the grace window (the DTMF
+    redirect fired but the stream never came back). Returns how many it reaped."""
+    now = time.monotonic() if now is None else now
+    reaped = 0
+    for group, bridge in list(app.state.bridges.items()):
+        since = bridge.reconnect_since
+        if bridge.reconnecting and since is not None and now - since > _RECONNECT_GRACE_S:
+            log.warning("media: reaping bridge %s — DTMF reconnect never arrived", group)
+            _teardown_group(app, group, reason="dropped", hang_up=True)
+            reaped += 1
+    return reaped
+
+
+# ---- socket plumbing ----------------------------------------------------
 async def _drain_loop(ws: WebSocket, drain) -> None:
     """Ship whatever the bridge has queued toward this leg. Polls every 20 ms —
     queued audio (AI speech, relayed frames) paces itself frame by frame."""
@@ -75,27 +147,18 @@ def _wire_dtmf(app, bridge: CallBridge, call_id: str, group: str) -> None:
     bridge.dtmf_redirect = press
 
 
-def _wire_notify(app, bridge: CallBridge, group: str) -> None:
-    """Give the bridge a way to text the user at handoff."""
-    twilio_client = app.state.twilio_client
-    number = app.state.user_numbers.pop(group, None)
-    if twilio_client is None or not number:
-        return
-
-    def notify(body: str) -> None:
-        try:
-            twilio_client.send_sms(number, body)
-        except Exception:
-            log.exception("media: handoff SMS failed for %s", group)
-
-    bridge.notify_user = notify
+def _wire_bridge_hooks(app, bridge: CallBridge, group: str) -> None:
+    """Text the user (handoff line or fallback) and tear the call down when the
+    session gives up — both without blocking the media loop."""
+    bridge.notify_user = lambda body: _sms(app, group, body)
+    bridge.on_teardown = lambda reason: _teardown_group(app, group, reason=reason, hang_up=True)
 
 
 async def _serve_user_leg(ws: WebSocket, app, group: str, stream_sid: str) -> None:
     """Attach a user leg to its group's bridge and pump its audio until it drops.
 
-    The user leg never owns the call's lifetime — if it drops, the agent leg's
-    own disconnect (or M8's recovery) handles teardown; we just detach here."""
+    If the user hangs up before the handoff, tell the session to give up — no
+    point navigating a menu for someone who's gone (the fallback SMS follows)."""
     bridge = None
     for _ in range(_USER_ATTACH_TRIES):
         bridge = app.state.bridges.get(group)
@@ -124,6 +187,29 @@ async def _serve_user_leg(ws: WebSocket, app, group: str, stream_sid: str) -> No
         with contextlib.suppress(asyncio.CancelledError):
             await writer
         bridge.user_stream_sid = None
+        if not bridge.relay_open and not bridge.session.finished:
+            log.warning("media: user hung up before the handoff — abandoning %s", group)
+            bridge.session.abort("user_left")
+
+
+def _redial_agent_leg(app, group: str) -> bool:
+    """Re-place the business call for `group`. Returns False if we can't (no
+    Twilio, no base URL, no stored number, or attempts exhausted)."""
+    meta = app.state.call_meta.get(group)
+    tw = app.state.twilio_client
+    base = app.state.settings.public_base_url
+    if not meta or tw is None or not base or meta.get("redials", 0) >= _MAX_REDIALS:
+        return False
+    meta["redials"] = meta.get("redials", 0) + 1
+    log.warning(
+        "media: agent leg %s dropped mid-call — redial %d/%d", group, meta["redials"], _MAX_REDIALS
+    )
+    try:
+        tw.place_outbound_call(meta["business_number"], f"{base}/twiml/voice?group={group}", group)
+    except Exception:
+        log.exception("media: redial failed for %s", group)
+        return False
+    return True
 
 
 @router.websocket("/media")
@@ -135,6 +221,7 @@ async def media_stream(ws: WebSocket) -> None:
     writer: asyncio.Task | None = None
     recorder: WavRecorder | None = None
     group = "unknown"
+    saw_stop = False
     try:
         while True:
             msg = json.loads(await ws.receive_text())
@@ -159,19 +246,20 @@ async def media_stream(ws: WebSocket) -> None:
                     recorder = bridge.recorder
                     bridge.bind_agent(stream_sid, asyncio.get_running_loop())
                     bridge.reconnecting = False
+                    bridge.reconnect_since = None
                     writer = asyncio.create_task(_drain_loop(ws, bridge.drain_agent))
                     log.info("media: agent leg reconnected, group %s", group)
                     continue
 
-                goal = app.state.pending_goals.pop(group, None)
-                user_leg_sid = app.state.user_legs.pop(group, None)
+                goal = app.state.pending_goals.get(group)
+                user_leg_sid = app.state.user_legs.get(group)
                 session = app.state.make_session(
                     call_id, goal=goal, conference=group, user_leg_sid=user_leg_sid
                 )
                 bridge = CallBridge(group, session)  # wires session hooks
                 bridge.bind_agent(stream_sid, asyncio.get_running_loop())
                 _wire_dtmf(app, bridge, call_id, group)
-                _wire_notify(app, bridge, group)
+                _wire_bridge_hooks(app, bridge, group)
                 if settings.openai_api_key:
                     # Swap the turn-based probe for the streaming one — it greets
                     # the line and listens over a live Realtime socket.
@@ -195,6 +283,7 @@ async def media_stream(ws: WebSocket) -> None:
                 bridge.on_agent_audio(payload)
 
             elif event == "stop":
+                saw_stop = True
                 break
     except WebSocketDisconnect:
         log.info("media: stream disconnected for group %s", group)
@@ -203,13 +292,31 @@ async def media_stream(ws: WebSocket) -> None:
             writer.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await writer
-        # A reconnect is imminent (DTMF redirect) — leave the bridge, its session
-        # and its recorder in place for the next socket. Otherwise it's really over.
-        if bridge is not None and not bridge.reconnecting:
-            bridge.close()  # also closes bridge.recorder
-            app.state.bridges.pop(bridge.group_id, None)
-            app.state.sessions.pop(bridge.session.call_id, None)
-        elif bridge is None and recorder is not None:
-            recorder.close()
+        _finish_agent_leg(app, bridge, group, saw_stop=saw_stop, recorder=recorder)
         with contextlib.suppress(RuntimeError):
             await ws.close()
+
+
+def _finish_agent_leg(app, bridge, group, *, saw_stop: bool, recorder) -> None:
+    if bridge is None:
+        if recorder is not None:
+            recorder.close()
+        return
+    if bridge.reconnecting:
+        # DTMF redirect in flight — leave the bridge for the reconnecting socket.
+        # reap_stale_bridges cleans it up if that reconnect never comes.
+        return
+
+    dropped_mid_call = not saw_stop and not bridge.session.finished
+    if dropped_mid_call and _redial_agent_leg(app, group):
+        # Re-dial placed. Drop this bridge but keep the per-group context — the
+        # fresh agent leg builds a new session for the same group.
+        if app.state.bridges.get(group) is bridge:
+            app.state.bridges.pop(group, None)
+        app.state.sessions.pop(bridge.session.call_id, None)
+        bridge.close()
+        return
+
+    _teardown_group(
+        app, group, reason="dropped" if dropped_mid_call else None, hang_up=dropped_mid_call
+    )

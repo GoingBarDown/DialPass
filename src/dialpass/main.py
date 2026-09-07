@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import contextlib
 import logging
 from collections.abc import AsyncIterator
@@ -12,9 +13,11 @@ from .agent.classifier import HeuristicClassifier
 from .agent.executor import ThreadedExecutor
 from .agent.session import AgentSession
 from .api import calls, health, media, spike, voice
+from .api.media import reap_stale_bridges
 from .config import get_settings
 from .realtime.client import RealtimeClient
 from .realtime.fake import FakeTier2
+from .resilience.circuit_breaker import CircuitBreaker
 from .telemetry.publisher import LogSink
 from .telemetry.sqs_sink import SqsSink, build_sqs_client
 from .telephony.twilio_client import TwilioClient
@@ -52,12 +55,29 @@ def _build_twilio_client(settings) -> TwilioClient | None:
     return None  # not configured -> /calls stays a 501 stub
 
 
+async def _bridge_reaper(app: FastAPI) -> None:
+    """Periodically clear bridges whose DTMF reconnect never came back (M8)."""
+    interval = app.state.settings.bridge_reap_interval_s
+    while True:
+        await asyncio.sleep(interval)
+        try:
+            reap_stale_bridges(app)
+        except Exception:
+            log.exception("bridge reaper pass failed")
+
+
 @contextlib.asynccontextmanager
 async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
-    yield
-    sink = getattr(app.state, "telemetry_sink", None)
-    if isinstance(sink, SqsSink):
-        sink.close()  # flush queued events before the process exits
+    reaper = asyncio.create_task(_bridge_reaper(app))
+    try:
+        yield
+    finally:
+        reaper.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await reaper
+        sink = getattr(app.state, "telemetry_sink", None)
+        if isinstance(sink, SqsSink):
+            sink.close()  # flush queued events before the process exits
 
 
 def create_app() -> FastAPI:
@@ -71,9 +91,16 @@ def create_app() -> FastAPI:
     app.state.pending_goals = {}  # group_id -> goal, set by /calls, consumed by /media
     app.state.user_legs = {}  # group_id -> user (Leg B) call_sid, for the handoff
     app.state.user_numbers = {}  # group_id -> user phone, for the handoff SMS
+    app.state.call_meta = {}  # group_id -> {business_number, redials}, for M8 re-dial
     app.state.twilio_client = _build_twilio_client(settings)
     # One telemetry sink for the whole process, shared by every call.
     app.state.telemetry_sink = _build_telemetry(settings)
+    # One circuit breaker for the whole process — one call's Tier 2 outage
+    # protects the next (fails fast to the fallback SMS until it recovers).
+    app.state.tier2_breaker = CircuitBreaker(
+        failure_threshold=settings.tier2_failure_threshold,
+        reset_timeout=settings.tier2_reset_timeout_s,
+    )
 
     def make_session(
         call_id: str,
@@ -91,6 +118,7 @@ def create_app() -> FastAPI:
             goal=goal,
             dtmf_sender=dtmf_sender,
             tier2_executor=ThreadedExecutor(),
+            tier2_breaker=app.state.tier2_breaker,
             conference=conference,
             user_leg_sid=user_leg_sid,
         )

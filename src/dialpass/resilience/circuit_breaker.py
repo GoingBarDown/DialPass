@@ -7,6 +7,7 @@ user instead of stranding the call.
 
 from __future__ import annotations
 
+import threading
 import time
 from collections.abc import Callable
 from enum import StrEnum
@@ -39,19 +40,22 @@ class CircuitBreaker:
         self._state = BreakerState.CLOSED
         self._failures = 0
         self._opened_at = 0.0
+        # Shared across every call's Tier 2 executor thread — guard the counters.
+        self._lock = threading.RLock()
 
     @property
     def state(self) -> BreakerState:
-        if self._state == BreakerState.OPEN and (
-            self._clock() - self._opened_at >= self._reset_timeout
-        ):
-            self._state = BreakerState.HALF_OPEN
-        return self._state
+        with self._lock:
+            if self._state == BreakerState.OPEN and (
+                self._clock() - self._opened_at >= self._reset_timeout
+            ):
+                self._state = BreakerState.HALF_OPEN
+            return self._state
 
     def call(self, fn: Callable[..., T], *args, **kwargs) -> T:
-        state = self.state
-        if state == BreakerState.OPEN:
-            raise CircuitOpenError("circuit is open")
+        with self._lock:
+            if self.state == BreakerState.OPEN:
+                raise CircuitOpenError("circuit is open")
         try:
             result = fn(*args, **kwargs)
         except Exception:
@@ -61,11 +65,13 @@ class CircuitBreaker:
         return result
 
     def _on_success(self) -> None:
-        self._failures = 0
-        self._state = BreakerState.CLOSED
+        with self._lock:
+            self._failures = 0
+            self._state = BreakerState.CLOSED
 
     def _on_failure(self) -> None:
-        self._failures += 1
-        if self._state == BreakerState.HALF_OPEN or self._failures >= self._threshold:
-            self._state = BreakerState.OPEN
-            self._opened_at = self._clock()
+        with self._lock:
+            self._failures += 1
+            if self._state == BreakerState.HALF_OPEN or self._failures >= self._threshold:
+                self._state = BreakerState.OPEN
+                self._opened_at = self._clock()

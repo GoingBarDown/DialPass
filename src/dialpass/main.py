@@ -7,6 +7,7 @@ import logging
 from fastapi import FastAPI
 
 from .agent.classifier import HeuristicClassifier
+from .agent.executor import ThreadedExecutor
 from .agent.session import AgentSession
 from .api import calls, health, media, voice
 from .config import get_settings
@@ -56,6 +57,7 @@ def create_app() -> FastAPI:
             settings=settings,
             goal=goal,
             dtmf_sender=dtmf_sender,
+            tier2_executor=ThreadedExecutor(),
         )
 
     app.state.make_session = make_session

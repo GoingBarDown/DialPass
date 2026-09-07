@@ -86,6 +86,8 @@ async def media_stream(ws: WebSocket) -> None:
     finally:
         if recorder is not None:
             recorder.close()
+        if session is not None:
+            session.close()
         app.state.sessions.pop(call_id, None)
         with contextlib.suppress(RuntimeError):
             await ws.close()

@@ -83,6 +83,12 @@ class FsmConfig:
     menu_refractory_s: float = 10.0
     menu_gap_frames: int = 4  # non-speech run that counts as "the prompt ended"
     max_menu_presses: int = 6  # safety rail: stop navigating after this many
+    # After this many menu reads in a row that found nothing to press, stop
+    # treating the line as a navigable menu: it's a queue (silent / music /
+    # spoken announcement) or a person. Drop to ON_HOLD so the probe can run —
+    # a real hold queue often has no music to trigger IVR_MENU -> ON_HOLD.
+    menu_noops_before_hold: int = 2
+    menu_speech_to_hold_frames: int = 6  # ~3s of unbroken speech = not a menu prompt
     # Block re-EVALUATING after a failed probe. We enter EVALUATING ~2s into an
     # interjection, so ~8s covers the tail of a typical one. A rare long
     # announcement gets re-probed once (cheap). M3: let strong evidence
@@ -106,6 +112,7 @@ class CallStateMachine:
         # re-triggering because the speech never stops.
         self._menu_gap_seen = False
         self._menu_presses = 0  # count of digits pressed this call (safety cap)
+        self._menu_noops = 0  # consecutive menu reads that found nothing to press
 
     # -- streak bookkeeping -------------------------------------------------
     def _streak_for(self, label: Label, confidence: float) -> int:
@@ -137,6 +144,7 @@ class CallStateMachine:
         if state == CallState.IVR_MENU:
             self._menu_woken = False
             self._menu_gap_seen = False
+            self._menu_noops = 0  # a fresh menu — re-evaluate whether it's navigable
 
     def _fall_back_to_hold(self, now: float) -> None:
         """Retreat to ON_HOLD after a failed probe, starting the refractory
@@ -193,7 +201,16 @@ class CallStateMachine:
             self._menu_presses += 1
             self._menu_woken = False
             self._menu_gap_seen = False
+            self._menu_noops = 0  # we made progress — this menu was navigable
             self._menu_refractory_until = now + self.cfg.menu_refractory_s
+
+    def note_menu_abstained(self) -> None:
+        """session.py calls this when a menu read produced no keypress. Enough of
+        these in a row and `_on_ivr_menu` stops waiting for a navigable menu and
+        drops to ON_HOLD so the probe can run (a queue with no music never
+        triggers the normal IVR_MENU -> ON_HOLD transition)."""
+        if self.state == CallState.IVR_MENU:
+            self._menu_noops += 1
 
     def bridged(self) -> None:
         """session.py calls this once it has started the handoff (told Tier 2
@@ -245,6 +262,25 @@ class CallStateMachine:
         if label == Label.HOLD_MUSIC and streak >= self.cfg.enter_hold_frames:
             self._enter(CallState.ON_HOLD)
             return Action.NONE
+
+        # The model has read this "menu" a few times and found nothing to press.
+        # It's a queue, not a menu — and a queue often has no music to trigger the
+        # transition above. Drop to ON_HOLD on any sustained non-speech OR a long
+        # unbroken speech run (a person / an announcement, not a chunked menu);
+        # ON_HOLD then runs the probe when speech holds.
+        if (
+            self._menu_noops >= self.cfg.menu_noops_before_hold
+            and now >= self._menu_refractory_until
+        ):
+            if label in HOLD_LABELS and streak >= self.cfg.enter_hold_frames:
+                self._enter(CallState.ON_HOLD)
+                return Action.NONE
+            if (
+                label == Label.LIVE_SPEECH_CANDIDATE
+                and streak >= self.cfg.menu_speech_to_hold_frames
+            ):
+                self._enter(CallState.ON_HOLD)
+                return Action.NONE
 
         # the current prompt ended — a submenu (if any) can now re-wake us
         if label in HOLD_LABELS and streak >= self.cfg.menu_gap_frames:

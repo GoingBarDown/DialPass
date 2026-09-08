@@ -5,12 +5,13 @@ from __future__ import annotations
 import pytest
 
 from dialpass.agent.classifier import ScriptedClassifier
+from dialpass.agent.labels import Label
 from dialpass.agent.session import AgentSession
 from dialpass.config import get_settings
 from dialpass.realtime.client import _parse_verdict
 from dialpass.realtime.fake import FakeTier2
 from dialpass.telemetry.publisher import CollectingSink
-from dialpass.testing import iter_frames, synthesize_call
+from dialpass.testing import Segment, iter_frames, synthesize_call
 
 
 @pytest.mark.parametrize(
@@ -81,3 +82,38 @@ def test_dtmf_sender_failure_does_not_crash_the_call():
     # the call kept going past the menu; the failure was swallowed
     assert sink.of_kind("dtmf_sent")  # telemetry still emitted
     assert session.state.value not in ("FAILED",) or sink.of_kind("frame_classified")
+
+
+# A real hold queue with NO music: menu, a gap, then a rep talking. The old FSM
+# sat in IVR_MENU forever (no HOLD_MUSIC -> no ON_HOLD -> no probe). Now, after a
+# couple of "nothing to press" reads, it drops to ON_HOLD and the probe runs.
+_MUSICLESS_QUEUE = [
+    Segment(Label.RINGBACK, 3.0),
+    Segment(Label.MENU_SPEAKING, 6.0),
+    Segment(Label.SILENCE, 3.0),
+    Segment(Label.MENU_SPEAKING, 5.0),  # a second prompt the model can't act on
+    Segment(Label.SILENCE, 4.0),
+    Segment(Label.LIVE_SPEECH_CANDIDATE, 10.0),  # a person picks up
+]
+
+
+def test_musicless_queue_still_reaches_the_probe_and_bridges():
+    settings = get_settings()
+    pcm, schedule = synthesize_call(_MUSICLESS_QUEUE)
+    sink = CollectingSink()
+    session = AgentSession(
+        "musicless",
+        ScriptedClassifier(schedule),
+        FakeTier2(menu_digits=None, probe_is_human=True),  # never a digit; the human is real
+        telemetry=sink,
+        settings=settings,
+        goal="reach a human",
+    )
+    for frame in iter_frames(pcm, settings.frame_ms):
+        session.feed_audio(frame)
+        if session.finished:
+            break
+
+    states = [e.payload()["to"] for e in sink.of_kind("state_changed")]
+    assert "ON_HOLD" in states and "EVALUATING_SPEECH" in states
+    assert [e.payload()["outcome"] for e in sink.of_kind("call_completed")] == ["human_bridged"]

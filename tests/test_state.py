@@ -135,3 +135,43 @@ def test_dialing_hold_music_goes_straight_to_hold_only_when_sustained():
     assert sm.state == CallState.DIALING
     feed(sm, Label.HOLD_MUSIC, sm.cfg.dialing_to_hold_frames, t0=10)
     assert sm.state == CallState.ON_HOLD
+
+
+def _stuck_in_menu(sm: CallStateMachine, *, abstains: int, t0: float = 0.0) -> None:
+    enter_menu(sm, t0=t0)
+    for _ in range(abstains):
+        sm.note_menu_abstained()
+
+
+def test_unnavigable_menu_drops_to_hold_on_silence():
+    """A queue with no music: the model keeps finding nothing to press, so the
+    FSM stops waiting for a menu and drops to ON_HOLD for the probe."""
+    sm = CallStateMachine()
+    _stuck_in_menu(sm, abstains=2)
+    feed(sm, Label.SILENCE, sm.cfg.enter_hold_frames, t0=20)  # past menu refractory
+    assert sm.state == CallState.ON_HOLD
+
+
+def test_unnavigable_menu_drops_to_hold_on_a_long_speech_run_then_probes():
+    sm = CallStateMachine()
+    _stuck_in_menu(sm, abstains=2)
+    feed(sm, Label.LIVE_SPEECH_CANDIDATE, sm.cfg.menu_speech_to_hold_frames, t0=20)
+    assert sm.state == CallState.ON_HOLD
+    action = feed(sm, Label.LIVE_SPEECH_CANDIDATE, sm.cfg.enter_eval_frames, t0=40)
+    assert sm.state == CallState.EVALUATING_SPEECH
+    assert action == Action.WAKE_TIER2_PROBE
+
+
+def test_one_abstain_is_not_enough_to_divert_a_menu():
+    sm = CallStateMachine()
+    _stuck_in_menu(sm, abstains=1)
+    feed(sm, Label.LIVE_SPEECH_CANDIDATE, 12, t0=20)
+    assert sm.state == CallState.IVR_MENU  # still treated as a menu
+
+
+def test_a_successful_press_resets_the_abstain_count():
+    sm = CallStateMachine()
+    _stuck_in_menu(sm, abstains=2)
+    sm.note_menu_action(now=15.0)  # a submenu digit landed — menu IS navigable
+    feed(sm, Label.LIVE_SPEECH_CANDIDATE, 12, t0=30)
+    assert sm.state == CallState.IVR_MENU

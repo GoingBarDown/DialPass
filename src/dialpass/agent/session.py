@@ -244,6 +244,9 @@ class AgentSession:
 
     def _apply_menu(self, decision, now: float) -> None:
         if not decision.digits:
+            # Nothing to press — count it; enough of these and the FSM stops
+            # waiting for a navigable menu and drops to ON_HOLD for the probe.
+            self.fsm.note_menu_abstained()
             return
         try:
             self.dtmf_sender(decision.digits)
